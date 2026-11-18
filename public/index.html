@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
-  <title>Email Gateway & OTP Service | dhyey.cc</title>
+  <title>Email Gateway, OTP & Broadcast Service | dhyey.cc</title>
   <link rel="stylesheet" href="style.css">
 </head>
 <body>
@@ -13,7 +13,7 @@
       <div class="brand">
         <span class="badge">API Gateway</span>
         <h1>Personal Email & Broadcast Gateway</h1>
-        <p class="subtitle">Multi-project email service: OTPs, resets, greetings, user retention & broadcasts.</p>
+        <p class="subtitle">Multi-project email service: High-Priority OTPs, Rate-Limited Broadcast Queue &amp; BYOS (Bring Your Own SMTP).</p>
       </div>
 
       <!-- Project / API Key Selector -->
@@ -22,11 +22,11 @@
         <div class="project-chips">
           <button type="button" class="chip active" data-project="abc" data-key="sk_abc_dev123">
             <strong>Project abc</strong>
-            <span class="tag">Subject: … - abc</span>
+            <span class="tag" id="tag-abc">Reply-To: support+abc@…</span>
           </button>
           <button type="button" class="chip" data-project="xyz" data-key="sk_xyz_dev123">
             <strong>Project xyz</strong>
-            <span class="tag">Subject: … - xyz</span>
+            <span class="tag" id="tag-xyz">Reply-To: support+xyz@…</span>
           </button>
           <button type="button" class="chip" data-project="custom">
             <strong>Custom Key</strong>
@@ -40,20 +40,23 @@
 
     <!-- Main Navigation Tabs -->
     <nav class="tabs">
-      <button class="tab-btn active" data-tab="otp">OTP Verification</button>
-      <button class="tab-btn" data-tab="broadcast">Broadcasts</button>
+      <button class="tab-btn active" data-tab="otp">OTP (Instant)</button>
+      <button class="tab-btn" data-tab="broadcast">Broadcast Queue</button>
+      <button class="tab-btn" data-tab="byos">Project SMTP &amp; Reply-To</button>
       <button class="tab-btn" data-tab="subscribers">Subscribers</button>
       <button class="tab-btn" data-tab="reset">Reset Password</button>
-      <button class="tab-btn" data-tab="greeting">Greeting / Welcome</button>
       <button class="tab-btn" data-tab="docs">API Quickstart</button>
     </nav>
 
-    <!-- TAB 1: OTP VERIFICATION (Ticket UI) -->
+    <!-- TAB 1: OTP VERIFICATION (Ticket UI - High Priority) -->
     <section class="tab-pane active" id="pane-otp">
       <main class="ticket">
         <div class="stub">
-          <h2>Email Verification</h2>
-          <p class="lede">Sends a 6-digit code with subject: <code id="otp-subject-preview">Verification Code - abc</code></p>
+          <div style="display:flex;justify-content:space-between;align-items:center;">
+            <h2>Email Verification</h2>
+            <span class="priority-badge high">⚡ High Priority Instant</span>
+          </div>
+          <p class="lede">Sends directly (bypasses broadcast queue). Subject: <code id="otp-subject-preview">Verification Code - abc</code></p>
         </div>
 
         <div class="ticket-body">
@@ -95,11 +98,14 @@
       </main>
     </section>
 
-    <!-- TAB 2: BROADCAST SYSTEM -->
+    <!-- TAB 2: BROADCAST QUEUE (Low Priority, Paced & Safe) -->
     <section class="tab-pane" id="pane-broadcast" hidden>
       <div class="card">
-        <h2>Broadcast Email</h2>
-        <p class="lede">Send announcements to retained users with custom header, footer & automatic unsubscribe link.</p>
+        <div style="display:flex;justify-content:space-between;align-items:center;">
+          <h2 style="margin:0;">Broadcast Delivery Queue</h2>
+          <span class="priority-badge low">⏳ Low Priority Paced Queue</span>
+        </div>
+        <p class="lede" style="margin-top:6px;">Sends safely under SMTP rate limits (~1.2s delay between sends) with one-click unsubscribe links.</p>
 
         <form id="form-broadcast" novalidate>
           <div class="form-group">
@@ -144,7 +150,7 @@
           </div>
 
           <details class="advanced-details">
-            <summary>Custom Header &amp; Footer Overrides (Optional)</summary>
+            <summary>Custom Header, Footer &amp; Reply-To Overrides (Optional)</summary>
             <div class="form-group" style="margin-top:12px;">
               <label for="bcast-header">Custom Header HTML / Title</label>
               <input id="bcast-header" type="text" placeholder="Override header title or HTML snippet">
@@ -155,20 +161,97 @@
             </div>
           </details>
 
-          <button type="submit" id="bcast-send-btn" class="btn primary" style="margin-top:16px;">Dispatch Broadcast</button>
+          <button type="submit" id="bcast-send-btn" class="btn primary" style="margin-top:16px;">Enqueue Broadcast Job</button>
         </form>
+
+        <!-- Progress Tracker -->
+        <div id="job-progress-box" class="progress-box" hidden>
+          <div class="progress-header">
+            <span>Job: <code id="job-id-label">...</code></span>
+            <span id="job-status-label" class="badge">queued</span>
+          </div>
+          <div class="progress-bar-bg">
+            <div id="job-progress-fill" class="progress-bar-fill" style="width: 0%;"></div>
+          </div>
+          <div class="progress-footer">
+            <span id="job-counts-label">0 / 0 sent</span>
+            <span id="job-pct-label">0%</span>
+          </div>
+        </div>
 
         <p id="msg-broadcast" class="status-msg" role="status" aria-live="polite"></p>
       </div>
     </section>
 
-    <!-- TAB 3: SUBSCRIBERS VIEWER -->
+    <!-- TAB 3: PROJECT SMTP & REPLY-TO (BYOS) -->
+    <section class="tab-pane" id="pane-byos" hidden>
+      <div class="card">
+        <h2>Bring Your Own SMTP (BYOS) &amp; Reply-To</h2>
+        <p class="lede">Assign custom email &amp; app-password for <strong class="ph-proj">abc</strong> so it uses its own quota with zero load on personal email.</p>
+
+        <div id="current-smtp-status" class="smtp-status-card">
+          <div class="status-indicator">
+            <span class="dot" id="smtp-dot"></span>
+            <strong id="smtp-status-title">Checking SMTP configuration…</strong>
+          </div>
+          <p id="smtp-status-desc" style="margin:4px 0 0;font-size:0.85rem;color:var(--muted);"></p>
+        </div>
+
+        <form id="form-byos" novalidate style="margin-top:20px;">
+          <div class="form-row">
+            <div class="form-group">
+              <label for="byos-user">SMTP Email Address</label>
+              <input id="byos-user" type="email" placeholder="user_project@gmail.com" required>
+            </div>
+            <div class="form-group">
+              <label for="byos-password">App Password (16-char)</label>
+              <input id="byos-password" type="password" placeholder="abcd efgh ijkl mnop" required>
+            </div>
+          </div>
+
+          <div class="form-row">
+            <div class="form-group">
+              <label for="byos-reply-to">Project Reply-To Email</label>
+              <input id="byos-reply-to" type="email" placeholder="support@myproject.com">
+              <small style="color:var(--muted);font-size:0.78rem;">When users click Reply, responses go directly to this inbox.</small>
+            </div>
+            <div class="form-group">
+              <label for="byos-from-name">Sender Display Name</label>
+              <input id="byos-from-name" type="text" placeholder="Project ABC Team">
+            </div>
+          </div>
+
+          <details class="advanced-details">
+            <summary>Custom Host &amp; Port Settings (Optional)</summary>
+            <div class="form-row" style="margin-top:12px;">
+              <div class="form-group">
+                <label for="byos-host">SMTP Host</label>
+                <input id="byos-host" type="text" value="smtp.gmail.com">
+              </div>
+              <div class="form-group">
+                <label for="byos-port">SMTP Port</label>
+                <input id="byos-port" type="number" value="465">
+              </div>
+            </div>
+          </details>
+
+          <div class="btn-group" style="display:flex;gap:10px;margin-top:18px;">
+            <button type="submit" id="byos-save-btn" class="btn primary" style="flex:2;">Verify &amp; Save Custom SMTP</button>
+            <button type="button" id="byos-delete-btn" class="btn secondary" style="flex:1;">Revert to Platform SMTP</button>
+          </div>
+        </form>
+
+        <p id="msg-byos" class="status-msg" role="status" aria-live="polite"></p>
+      </div>
+    </section>
+
+    <!-- TAB 4: SUBSCRIBERS VIEWER -->
     <section class="tab-pane" id="pane-subscribers" hidden>
       <div class="card">
         <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
           <div>
             <h2 style="margin:0;">Retained Users / Subscribers</h2>
-            <p class="lede" style="margin:4px 0 0;">Users automatically recorded per project during OTPs, resets, or greetings.</p>
+            <p class="lede" style="margin:4px 0 0;">Users automatically recorded per project. Unsubscribed users are retained but excluded from broadcasts.</p>
           </div>
           <button type="button" id="refresh-subs-btn" class="btn secondary" style="width:auto;padding:8px 14px;font-size:0.85rem;">Refresh</button>
         </div>
@@ -195,11 +278,14 @@
       </div>
     </section>
 
-    <!-- TAB 4: RESET PASSWORD TESTER -->
+    <!-- TAB 5: RESET PASSWORD TESTER (High Priority) -->
     <section class="tab-pane" id="pane-reset" hidden>
       <div class="card">
-        <h2>Send Password Reset</h2>
-        <p class="lede">Sends an email with subject <code id="reset-subject-preview">Reset Password - abc</code></p>
+        <div style="display:flex;justify-content:space-between;align-items:center;">
+          <h2 style="margin:0;">Send Password Reset</h2>
+          <span class="priority-badge high">⚡ High Priority Instant</span>
+        </div>
+        <p class="lede" style="margin-top:6px;">Sends an email with subject <code id="reset-subject-preview">Reset Password - abc</code></p>
         
         <form id="form-reset" novalidate>
           <div class="form-group">
@@ -227,96 +313,60 @@
       </div>
     </section>
 
-    <!-- TAB 5: GREETING EMAIL TESTER -->
-    <section class="tab-pane" id="pane-greeting" hidden>
-      <div class="card">
-        <h2>Send Welcome / Greeting Email</h2>
-        <p class="lede">Sends an email with subject <code id="greeting-subject-preview">Welcome - abc</code></p>
-
-        <form id="form-greeting" novalidate>
-          <div class="form-group">
-            <label for="greet-email">Recipient Email</label>
-            <input id="greet-email" type="email" placeholder="user@example.com" required>
-          </div>
-          <div class="form-row">
-            <div class="form-group">
-              <label for="greet-name">User Name (Optional)</label>
-              <input id="greet-name" type="text" placeholder="e.g. Alex">
-            </div>
-            <div class="form-group">
-              <label for="greet-title">Email Title</label>
-              <input id="greet-title" type="text" value="Welcome aboard!">
-            </div>
-          </div>
-          <div class="form-group">
-            <label for="greet-message">Message Body (HTML supported)</label>
-            <textarea id="greet-message" rows="3">We are delighted to have you with us. Your account is ready.</textarea>
-          </div>
-          <div class="form-row">
-            <div class="form-group">
-              <label for="greet-action-url">Action Button URL (Optional)</label>
-              <input id="greet-action-url" type="url" value="https://dhyey.cc">
-            </div>
-            <div class="form-group">
-              <label for="greet-action-label">Button Text</label>
-              <input id="greet-action-label" type="text" value="Go to Dashboard">
-            </div>
-          </div>
-          <button type="submit" id="greeting-send-btn" class="btn primary">Send Greeting Email</button>
-        </form>
-
-        <p id="msg-greeting" class="status-msg" role="status" aria-live="polite"></p>
-      </div>
-    </section>
-
     <!-- TAB 6: API QUICKSTART & CODE EXAMPLES -->
     <section class="tab-pane" id="pane-docs" hidden>
       <div class="card docs-card">
         <h2>Developer API Integration</h2>
-        <p class="lede">Ready-to-use snippets for OTPs, broadcasts, password resets, and greetings.</p>
+        <p class="lede">Priority architecture, BYOS custom SMTP &amp; per-project Reply-To integration.</p>
 
-        <!-- Broadcast snippet -->
+        <!-- BYOS Snippet -->
         <div class="code-box">
           <div class="code-header">
-            <span>JavaScript (fetch) — Send Project Broadcast</span>
-            <button class="copy-btn" data-copy="js-bcast">Copy</button>
+            <span>JavaScript (fetch) — Configure Custom SMTP (BYOS)</span>
+            <button class="copy-btn" data-copy="js-byos">Copy</button>
           </div>
-          <pre><code id="code-js-bcast">await fetch("https://your-service.vercel.app/api/broadcast", {
+          <pre><code id="code-js-byos">// Use your own Gmail/SMTP to avoid loading the platform owner's account
+await fetch("https://your-service.vercel.app/api/project/smtp", {
   method: "POST",
   headers: {
     "Content-Type": "application/json",
-    "X-API-Key": "<span class="ph-key">sk_abc_dev123</span>" // Broadcasts to all users of <span class="ph-proj">abc</span>
+    "X-API-Key": "<span class="ph-key">sk_abc_dev123</span>"
   },
   body: JSON.stringify({
-    subject: "Monthly Newsletter",
-    title: "What's new in our platform",
-    message: "&lt;p&gt;Here are your latest product updates...&lt;/p&gt;",
-    action_url: "https://myapp.com/blog",
-    action_label: "Read Article"
+    user: "my_project@gmail.com",
+    password: "my_16_char_app_password",
+    reply_to: "support@myproject.com",
+    from_name: "My Project Team"
   })
 });</code></pre>
         </div>
 
-        <!-- Global Broadcast snippet -->
+        <!-- Broadcast snippet -->
         <div class="code-box">
           <div class="code-header">
-            <span>cURL — Global All-Projects Broadcast (Master Key)</span>
-            <button class="copy-btn" data-copy="curl-all">Copy</button>
+            <span>JavaScript (fetch) — Enqueue Safe Broadcast (Low Priority)</span>
+            <button class="copy-btn" data-copy="js-bcast">Copy</button>
           </div>
-          <pre><code id="code-curl-all">curl -X POST https://your-service.vercel.app/api/broadcast/all \
-  -H "Content-Type: application/json" \
-  -H "X-API-Key: master_secret_change_me_12345" \
-  -d '{
-    "subject": "Scheduled Maintenance Announcement",
-    "title": "System Update on Sunday",
-    "message": "&lt;p&gt;All project APIs will remain operational.&lt;/p&gt;"
-  }'</code></pre>
+          <pre><code id="code-js-bcast">const res = await fetch("https://your-service.vercel.app/api/broadcast", {
+  method: "POST",
+  headers: {
+    "Content-Type": "application/json",
+    "X-API-Key": "<span class="ph-key">sk_abc_dev123</span>"
+  },
+  body: JSON.stringify({
+    subject: "Monthly Newsletter",
+    title: "What's new in our platform",
+    message: "&lt;p&gt;Here are your latest product updates...&lt;/p&gt;"
+  })
+});
+const data = await res.json();
+console.log("Queued Job ID:", data.jobId);</code></pre>
         </div>
 
-        <!-- OTP Snippet -->
+        <!-- High Priority OTP -->
         <div class="code-box">
           <div class="code-header">
-            <span>Python (requests) — Send OTP</span>
+            <span>Python (requests) — High-Priority Immediate OTP</span>
             <button class="copy-btn" data-copy="py-otp">Copy</button>
           </div>
           <pre><code id="code-py-otp">import requests
@@ -326,6 +376,7 @@ res = requests.post(
     headers={"X-API-Key": "<span class="ph-key">sk_abc_dev123</span>"},
     json={"email": "user@example.com"}
 )
+# Returns immediately: {"priority": "immediate", "success": True}
 print(res.json())</code></pre>
         </div>
       </div>

@@ -1,17 +1,17 @@
-"""Multi-Project Email Gateway & OTP Service.
+"""Multi-Project Email Gateway, OTP & Broadcast Service.
 
-Supports:
+Features:
 - Per-project API keys (e.g. project 'abc', project 'xyz').
-- Automatic project user retention / subscriber tracking per project.
-- Broadcast capabilities:
-    1. Per-project broadcast (POST /api/broadcast)
-    2. All-projects broadcast (POST /api/broadcast/all)
+- Per-project Reply-To support and routing headers (X-Project-ID, X-Project-Name).
+- Bring-Your-Own-SMTP (BYOS): Projects can provide their own email & pass/app-password,
+  completely removing load from the platform owner's personal email.
+- Priority Queue Architecture:
+    * High-Priority: OTPs, Password Resets, Critical emails (sent immediately).
+    * Low-Priority Queue: Broadcasts (paced safely with rate-limiting delay,
+      persisted in MongoDB broadcast_queue and broadcast_jobs).
 - One-click unsubscribe system (GET & POST /api/unsubscribe) with RFC 8058 headers.
+- Automatic project user retention per project with smart re-activation.
 - Customizable Header & Footer per project and per email.
-- Branded emails with automatic project-name subjects:
-    "Reset Password - abc", "Reset Password - xyz", "Verification Code - abc"
-- Future-proof SMTP: works with Personal Gmail (App Password) now,
-  and easily switches to Google Workspace / Business Email (@dhyey.cc) anytime.
 - Serverless ready (Vercel) & local runnable.
 """
 import hashlib
@@ -21,6 +21,7 @@ import re
 import secrets
 import smtplib
 import ssl
+import threading
 import time
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
@@ -43,7 +44,7 @@ APP_URL = os.getenv("APP_URL", "")
 PROJECT_ABC_KEY = os.getenv("PROJECT_ABC_KEY", "sk_abc_dev123")
 PROJECT_XYZ_KEY = os.getenv("PROJECT_XYZ_KEY", "sk_xyz_dev123")
 
-# SMTP Configuration (Works for Personal Gmail and Business Email)
+# Default Platform SMTP Configuration (Fallback when projects don't provide custom SMTP)
 SMTP_HOST = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.getenv("SMTP_PORT", "465"))
 SMTP_USE_SSL = os.getenv("SMTP_SECURE", "true").lower() in ("true", "1", "yes") or SMTP_PORT == 465
@@ -55,12 +56,14 @@ SMTP_PASSWORD = _pwd_raw.replace(" ", "")
 
 SMTP_FROM_EMAIL = os.getenv("SMTP_FROM_EMAIL") or SMTP_USER
 SMTP_FROM_NAME = os.getenv("SMTP_FROM_NAME", "Passcode")
+SMTP_REPLY_TO = os.getenv("SMTP_REPLY_TO", "")
 
-# Rate limiting and OTP defaults
+# Rate limiting and Queue settings
 OTP_TTL_MINUTES = int(os.getenv("OTP_TTL_MINUTES", "5"))
 RESEND_COOLDOWN = int(os.getenv("RESEND_COOLDOWN_SECONDS", "60"))
 MAX_ATTEMPTS = int(os.getenv("MAX_ATTEMPTS", "5"))
 IP_HOURLY_LIMIT = int(os.getenv("IP_HOURLY_LIMIT", "30"))
+BROADCAST_DELAY_SECONDS = float(os.getenv("BROADCAST_DELAY_SECONDS", "1.2"))
 
 EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "public")
@@ -91,6 +94,8 @@ def get_db():
         db.projects.create_index([("apiKey", ASCENDING)], unique=True)
         db.subscribers.create_index([("projectId", ASCENDING), ("isSubscribed", ASCENDING)])
         db.subscribers.create_index([("email", ASCENDING)])
+        db.broadcast_jobs.create_index([("createdAt", ASCENDING)])
+        db.broadcast_queue.create_index([("jobId", ASCENDING), ("status", ASCENDING)])
 
         # Auto-seed initial projects 'abc' and 'xyz' if collection is empty
         try:
@@ -102,8 +107,10 @@ def get_db():
                         "name": "abc",
                         "apiKey": PROJECT_ABC_KEY,
                         "fromName": "abc",
+                        "replyToEmail": "support+abc@dhyey.cc",
                         "headerTitle": "Project abc",
                         "footerText": "© 2026 Project abc. All rights reserved.",
+                        "smtp": {"enabled": False},
                         "isActive": True,
                         "createdAt": now_t,
                     },
@@ -112,8 +119,10 @@ def get_db():
                         "name": "xyz",
                         "apiKey": PROJECT_XYZ_KEY,
                         "fromName": "xyz",
+                        "replyToEmail": "support+xyz@dhyey.cc",
                         "headerTitle": "Project xyz",
                         "footerText": "© 2026 Project xyz. All rights reserved.",
+                        "smtp": {"enabled": False},
                         "isActive": True,
                         "createdAt": now_t,
                     },
@@ -150,8 +159,8 @@ def hash_otp(project_id, email, otp):
 def record_subscriber(project_id, email, name=None, source="auto", reactivate=True):
     """Auto-remembers user email under the given project.
     
-    If the user was previously unsubscribed, using a service like OTP or
-    Reset Password automatically restores them to a normal active subscriber.
+    If reactivate=True (e.g. from OTP, Reset Password, or Service interaction),
+    an unsubscribed user is automatically restored back to a normal subscriber.
     """
     try:
         db = get_db()
@@ -183,7 +192,7 @@ def record_subscriber(project_id, email, name=None, source="auto", reactivate=Tr
             upsert=True,
         )
     except Exception:
-        pass  # Never block critical email dispatch if subscriber recording fails
+        pass
 
 
 def make_unsub_sig(project_id, email):
@@ -227,17 +236,28 @@ def resolve_project():
             "_id": proj_name.lower().replace(" ", "_"),
             "name": proj_name,
             "fromName": proj_name,
+            "replyToEmail": SMTP_REPLY_TO or f"support+{proj_name.lower()}@dhyey.cc",
             "apiKey": MASTER_API_KEY,
             "isMaster": True,
             "isActive": True,
         }, None
 
-    # Fast-path resolution for pre-configured project keys
+    # First attempt DB lookup so custom SMTP and settings are fresh
+    try:
+        db = get_db()
+        project = db.projects.find_one({"apiKey": key, "isActive": True})
+        if project:
+            return project, None
+    except Exception:
+        pass
+
+    # Fast-path fallback for pre-configured project keys if DB is offline
     if PROJECT_ABC_KEY and key == PROJECT_ABC_KEY:
         return {
             "_id": "abc",
             "name": "abc",
             "fromName": "abc",
+            "replyToEmail": "support+abc@dhyey.cc",
             "headerTitle": "Project abc",
             "footerText": "© 2026 Project abc. All rights reserved.",
             "apiKey": PROJECT_ABC_KEY,
@@ -248,32 +268,25 @@ def resolve_project():
             "_id": "xyz",
             "name": "xyz",
             "fromName": "xyz",
+            "replyToEmail": "support+xyz@dhyey.cc",
             "headerTitle": "Project xyz",
             "footerText": "© 2026 Project xyz. All rights reserved.",
             "apiKey": PROJECT_XYZ_KEY,
             "isActive": True,
         }, None
 
-    try:
-        db = get_db()
-        project = db.projects.find_one({"apiKey": key, "isActive": True})
-        if project:
-            return project, None
-    except Exception:
-        pass
-
     return None, fail("forbidden", "Invalid or revoked API key.", 403)
 
 
 # ==============================================================================
-# Subject & Email Formatting
+# Subject, From & Reply-To Formatting
 # ==============================================================================
 def format_subject(base_subject, project):
     """Ensures the subject line cleanly includes the project name.
 
     E.g. "Reset Password" -> "Reset Password - abc"
     """
-    proj_name = project.get("name", "Passcode")
+    proj_name = project.get("name", "Passcode") if isinstance(project, dict) else str(project)
     base = (base_subject or "").strip()
     suffix = f"- {proj_name}"
 
@@ -285,15 +298,51 @@ def format_subject(base_subject, project):
 
 
 def format_from(project):
+    """Resolves From header respecting custom BYOS credentials if enabled."""
+    custom_smtp = project.get("smtp", {}) if isinstance(project, dict) else {}
+    if custom_smtp.get("enabled") and custom_smtp.get("fromEmail"):
+        from_name = custom_smtp.get("fromName") or project.get("fromName") or project.get("name") or "Passcode"
+        return f"{from_name} <{custom_smtp['fromEmail']}>"
+
     name = project.get("fromName") or project.get("name") or SMTP_FROM_NAME
     return f"{name} <{SMTP_FROM_EMAIL}>"
 
 
+def format_reply_to(project, custom_reply_to=None):
+    """Resolves per-project Reply-To header.
+
+    When recipients hit Reply, their email client directs the message here.
+    """
+    if custom_reply_to:
+        return custom_reply_to
+
+    # 1. Check project custom reply-to
+    if isinstance(project, dict) and project.get("replyToEmail"):
+        return project["replyToEmail"]
+
+    # 2. Check custom SMTP user email if provided
+    custom_smtp = project.get("smtp", {}) if isinstance(project, dict) else {}
+    if custom_smtp.get("enabled") and custom_smtp.get("replyTo"):
+        return custom_smtp["replyTo"]
+    if custom_smtp.get("enabled") and custom_smtp.get("user"):
+        return custom_smtp["user"]
+
+    # 3. Fallback: subaddress or platform reply-to
+    proj_name = project.get("name", "support") if isinstance(project, dict) else "support"
+    if SMTP_REPLY_TO:
+        return SMTP_REPLY_TO
+    if SMTP_FROM_EMAIL and "@" in SMTP_FROM_EMAIL:
+        user, domain = SMTP_FROM_EMAIL.split("@", 1)
+        return f"{user}+{proj_name.lower()}@{domain}"
+
+    return SMTP_FROM_EMAIL
+
+
 # ==============================================================================
-# HTML Email Templates (With Customizable Header & Footer)
+# HTML Email Templates
 # ==============================================================================
 def render_email_shell(project, inner_html, custom_header=None, custom_footer=None, unsub_url=None):
-    """Responsive branded HTML shell with custom header and footer support."""
+    """Responsive branded HTML shell with custom header, footer, and Reply-To note."""
     project_name = project.get("name", "Passcode") if isinstance(project, dict) else str(project)
     safe_name = escape(project_name)
 
@@ -436,17 +485,41 @@ def render_broadcast_template(project, title, message, action_url=None, action_l
 
 
 # ==============================================================================
-# SMTP Delivery Engine
+# SMTP Delivery Engine (With BYOS & Reply-To Routing)
 # ==============================================================================
-def send_email_message(to_email, subject, text_content, html_content, from_header, unsub_url=None):
-    """Robust SMTP dispatcher supporting SSL (465) and STARTTLS (587) with RFC 8058 headers."""
-    if not SMTP_USER or not SMTP_PASSWORD:
+def send_email_message(to_email, subject, text_content, html_content, from_header, unsub_url=None, reply_to=None, project=None):
+    """Robust SMTP dispatcher supporting BYOS (Bring-Your-Own-SMTP) and project routing."""
+    # Check if project has configured its own custom SMTP
+    custom_smtp = (project.get("smtp", {}) if isinstance(project, dict) else {}) or {}
+    use_custom = custom_smtp.get("enabled") and custom_smtp.get("user") and custom_smtp.get("password")
+
+    if use_custom:
+        host = custom_smtp.get("host") or "smtp.gmail.com"
+        port = int(custom_smtp.get("port", 465))
+        use_ssl = custom_smtp.get("secure", True) or port == 465
+        user = custom_smtp.get("user", "")
+        password = str(custom_smtp.get("password", "")).replace(" ", "")
+    else:
+        host = SMTP_HOST
+        port = SMTP_PORT
+        use_ssl = SMTP_USE_SSL
+        user = SMTP_USER
+        password = SMTP_PASSWORD
+
+    if not user or not password:
         raise smtplib.SMTPAuthenticationError(535, b"SMTP credentials are not configured.")
 
     msg = EmailMessage()
     msg["Subject"] = subject
     msg["From"] = from_header
     msg["To"] = to_email
+
+    # Routing & Reply-To Headers
+    if reply_to:
+        msg["Reply-To"] = reply_to
+    if isinstance(project, dict):
+        msg["X-Project-ID"] = str(project.get("_id", ""))
+        msg["X-Project-Name"] = str(project.get("name", ""))
 
     # RFC 8058 One-Click List-Unsubscribe Header
     if unsub_url:
@@ -460,17 +533,76 @@ def send_email_message(to_email, subject, text_content, html_content, from_heade
 
     context = ssl.create_default_context()
 
-    if SMTP_USE_SSL or SMTP_PORT == 465:
-        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, context=context, timeout=15) as server:
-            server.login(SMTP_USER, SMTP_PASSWORD)
+    if use_ssl or port == 465:
+        with smtplib.SMTP_SSL(host, port, context=context, timeout=15) as server:
+            server.login(user, password)
             server.send_message(msg)
     else:
-        with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=15) as server:
+        with smtplib.SMTP(host, port, timeout=15) as server:
             server.ehlo()
             server.starttls(context=context)
             server.ehlo()
-            server.login(SMTP_USER, SMTP_PASSWORD)
+            server.login(user, password)
             server.send_message(msg)
+
+
+# ==============================================================================
+# Rate-Limited Broadcast Queue Processor
+# ==============================================================================
+def process_broadcast_queue_job(job_id):
+    """Processes a broadcast job safely with rate-limit pacing delay."""
+    try:
+        db = get_db()
+        job = db.broadcast_jobs.find_one({"_id": job_id})
+        if not job or job.get("status") == "completed":
+            return
+
+        db.broadcast_jobs.update_one({"_id": job_id}, {"$set": {"status": "processing", "startedAt": now()}})
+
+        project = db.projects.find_one({"_id": job["projectId"]}) or {
+            "_id": job["projectId"],
+            "name": job.get("projectName", job["projectId"]),
+            "fromName": job.get("projectName", job["projectId"]),
+        }
+
+        # Fetch pending recipient items
+        pending_items = list(db.broadcast_queue.find({"jobId": job_id, "status": "pending"}))
+        from_header = format_from(project)
+        reply_to = format_reply_to(project)
+
+        for item in pending_items:
+            recipient = item["email"]
+            unsub_url = get_unsub_url(str(project["_id"]), recipient)
+            html_body = render_broadcast_template(
+                project,
+                job["title"],
+                job["message"],
+                job.get("actionUrl"),
+                job.get("actionLabel"),
+                job.get("customHeader"),
+                job.get("customFooter"),
+                unsub_url,
+            )
+            text_body = f"{job['title']}\n\n{job['message']}\n\nUnsubscribe: {unsub_url}"
+
+            try:
+                send_email_message(recipient, job["subject"], text_body, html_body, from_header, unsub_url, reply_to, project)
+                db.broadcast_queue.update_one({"_id": item["_id"]}, {"$set": {"status": "sent", "sentAt": now()}})
+                db.broadcast_jobs.update_one({"_id": job_id}, {"$inc": {"sentCount": 1}})
+            except Exception as e:
+                db.broadcast_queue.update_one(
+                    {"_id": item["_id"]},
+                    {"$set": {"status": "failed", "error": str(e), "failedAt": now()}, "$inc": {"attempts": 1}},
+                )
+                db.broadcast_jobs.update_one({"_id": job_id}, {"$inc": {"failedCount": 1}})
+
+            # Safe rate limit delay to avoid hitting SMTP burst barriers
+            if BROADCAST_DELAY_SECONDS > 0:
+                time.sleep(BROADCAST_DELAY_SECONDS)
+
+        db.broadcast_jobs.update_one({"_id": job_id}, {"$set": {"status": "completed", "completedAt": now()}})
+    except Exception as exc:
+        app.logger.exception("Error processing broadcast queue job %s: %s", job_id, exc)
 
 
 # ==============================================================================
@@ -503,7 +635,7 @@ def health():
 
 
 # ------------------------------------------------------------------------------
-# 1. Send OTP (Project-Scoped & Remembers Subscriber)
+# 1. Send OTP (High-Priority: Synchronous Direct Dispatch)
 # ------------------------------------------------------------------------------
 @app.post("/api/send-otp")
 @app.post("/api/resend-otp")
@@ -545,11 +677,13 @@ def send_otp():
     html_body = render_otp_template(project, otp, OTP_TTL_MINUTES)
     text_body = f"Your verification code for {project['name']} is {otp}. It expires in {OTP_TTL_MINUTES} minutes."
     from_header = format_from(project)
+    reply_to = format_reply_to(project, data.get("reply_to"))
 
+    # Direct immediate dispatch (bypasses low-priority broadcast queue)
     try:
-        send_email_message(email, subject, text_body, html_body, from_header)
+        send_email_message(email, subject, text_body, html_body, from_header, reply_to=reply_to, project=project)
     except smtplib.SMTPAuthenticationError:
-        return fail("smtp_auth", "SMTP authentication failed. Verify SMTP_USER and SMTP_PASSWORD.", 502)
+        return fail("smtp_auth", "SMTP authentication failed. Verify credentials.", 502)
     except (smtplib.SMTPException, OSError):
         return fail("smtp_unreachable", "Couldn't send the email. Check SMTP host and network.", 502)
 
@@ -568,20 +702,22 @@ def send_otp():
         upsert=True,
     )
 
-    # Automatically remember user email for this project
-    record_subscriber(project_id, email, source="otp")
+    # Automatically remember/reactivate user email for this project
+    record_subscriber(project_id, email, source="otp", reactivate=True)
 
     return jsonify({
         "success": True,
         "message": f"Verification code sent to {email}",
         "project": project["name"],
+        "replyTo": reply_to,
+        "priority": "immediate",
         "expiresInMinutes": OTP_TTL_MINUTES,
         "cooldownSeconds": RESEND_COOLDOWN,
     })
 
 
 # ------------------------------------------------------------------------------
-# 2. Verify OTP (Project-Scoped)
+# 2. Verify OTP (High-Priority: Synchronous Direct Verification)
 # ------------------------------------------------------------------------------
 @app.post("/api/verify-otp")
 def verify_otp():
@@ -614,10 +750,9 @@ def verify_otp():
 
     expected_hash = hash_otp(project_id, email, otp)
     if hmac.compare_digest(doc["hash"], expected_hash):
-        # Strict single-use: delete matching hash
         res = db.otps.delete_one({"_id": scoped_id, "hash": doc["hash"]})
         if res.deleted_count == 1:
-            record_subscriber(project_id, email, source="verified_otp")
+            record_subscriber(project_id, email, source="verified_otp", reactivate=True)
             return jsonify({
                 "success": True,
                 "message": f"Email verified successfully for {project['name']}.",
@@ -639,7 +774,7 @@ def verify_otp():
 
 
 # ------------------------------------------------------------------------------
-# 3. Send Reset Password Email
+# 3. Send Reset Password Email (High-Priority: Synchronous Direct Dispatch)
 # ------------------------------------------------------------------------------
 @app.post("/api/send-reset-password")
 def send_reset_password():
@@ -665,21 +800,25 @@ def send_reset_password():
     html_body = render_reset_password_template(project, reset_url, reset_code, name, expires_in)
     text_body = f"Reset password for {project['name']}: {reset_url or reset_code}"
     from_header = format_from(project)
+    reply_to = format_reply_to(project, data.get("reply_to"))
 
+    # Direct immediate dispatch
     try:
-        send_email_message(email, subject, text_body, html_body, from_header)
+        send_email_message(email, subject, text_body, html_body, from_header, reply_to=reply_to, project=project)
     except smtplib.SMTPAuthenticationError:
-        return fail("smtp_auth", "SMTP authentication failed. Check SMTP_USER and SMTP_PASSWORD.", 502)
+        return fail("smtp_auth", "SMTP authentication failed. Check credentials.", 502)
     except Exception as e:
         app.logger.exception(e)
         return fail("smtp_unreachable", "Couldn't send reset password email.", 502)
 
-    record_subscriber(str(project["_id"]), email, name=name, source="reset_password")
+    record_subscriber(str(project["_id"]), email, name=name, source="reset_password", reactivate=True)
 
     return jsonify({
         "success": True,
         "message": f"Password reset email sent to {email}",
         "subject": subject,
+        "replyTo": reply_to,
+        "priority": "immediate",
         "project": project["name"],
     })
 
@@ -711,21 +850,23 @@ def send_greeting():
     html_body = render_greeting_template(project, title, message, name, action_url, action_label, unsub_url)
     text_body = f"{title}\n\nWelcome to {project['name']}!\n\nUnsubscribe: {unsub_url}"
     from_header = format_from(project)
+    reply_to = format_reply_to(project, data.get("reply_to"))
 
     try:
-        send_email_message(email, subject, text_body, html_body, from_header, unsub_url=unsub_url)
+        send_email_message(email, subject, text_body, html_body, from_header, unsub_url=unsub_url, reply_to=reply_to, project=project)
     except smtplib.SMTPAuthenticationError:
-        return fail("smtp_auth", "SMTP authentication failed. Check SMTP_USER and SMTP_PASSWORD.", 502)
+        return fail("smtp_auth", "SMTP authentication failed. Check credentials.", 502)
     except Exception as e:
         app.logger.exception(e)
         return fail("smtp_unreachable", "Couldn't send greeting email.", 502)
 
-    record_subscriber(project_id, email, name=name, source="greeting")
+    record_subscriber(project_id, email, name=name, source="greeting", reactivate=True)
 
     return jsonify({
         "success": True,
         "message": f"Greeting sent to {email}",
         "subject": subject,
+        "replyTo": reply_to,
         "project": project["name"],
     })
 
@@ -760,31 +901,33 @@ def send_mail_custom():
     subject = format_subject(subject_raw, project)
     html_body = render_email_shell(project, html_raw, custom_header=custom_header, custom_footer=custom_footer, unsub_url=unsub_url) if html_raw else None
     from_header = format_from(project)
+    reply_to = format_reply_to(project, data.get("reply_to"))
 
     try:
-        send_email_message(to_email, subject, text_raw, html_body, from_header, unsub_url=unsub_url)
+        send_email_message(to_email, subject, text_raw, html_body, from_header, unsub_url=unsub_url, reply_to=reply_to, project=project)
     except smtplib.SMTPAuthenticationError:
-        return fail("smtp_auth", "SMTP authentication failed. Check SMTP_USER and SMTP_PASSWORD.", 502)
+        return fail("smtp_auth", "SMTP authentication failed. Check credentials.", 502)
     except Exception as e:
         app.logger.exception(e)
         return fail("smtp_unreachable", "Couldn't send email.", 502)
 
-    record_subscriber(project_id, to_email, source="custom_mail")
+    record_subscriber(project_id, to_email, source="custom_mail", reactivate=True)
 
     return jsonify({
         "success": True,
         "message": f"Email delivered to {to_email}",
         "subject": subject,
+        "replyTo": reply_to,
         "project": project["name"],
     })
 
 
 # ------------------------------------------------------------------------------
-# 6. Broadcast Messages (Per-Project & All-Projects)
+# 6. Broadcast Queue & Job Endpoints (Rate-Limited, Non-Blocking)
 # ------------------------------------------------------------------------------
 @app.post("/api/broadcast")
-def broadcast_project():
-    """Broadcasts a message to all active subscribers registered to this project."""
+def enqueue_project_broadcast():
+    """Enqueues a broadcast message to all active subscribers for safe rate-limited delivery."""
     project, err = resolve_project()
     if err:
         return err
@@ -798,10 +941,8 @@ def broadcast_project():
     custom_header = data.get("custom_header")
     custom_footer = data.get("custom_footer")
 
-    if not subject_raw:
-        return fail("missing_subject", "'subject' is required for broadcast.", 400)
-    if not message:
-        return fail("missing_message", "'message' is required for broadcast.", 400)
+    if not subject_raw or not message:
+        return fail("invalid_parameters", "'subject' and 'message' are required.", 400)
 
     db = get_db()
     project_id = str(project["_id"])
@@ -811,44 +952,67 @@ def broadcast_project():
         return jsonify({
             "success": True,
             "message": f"No active subscribers found for project '{project['name']}'.",
-            "sentCount": 0,
-            "totalSubscribers": 0,
+            "jobId": None,
+            "totalRecipients": 0,
         })
 
     subject = format_subject(subject_raw, project)
-    from_header = format_from(project)
-    sent_count = 0
-    failed_count = 0
+    job_id = f"job_{project_id}_{int(time.time())}_{secrets.token_hex(4)}"
 
-    for sub in subscribers:
-        recipient = sub.get("email")
-        if not recipient:
-            continue
-        unsub_url = get_unsub_url(project_id, recipient)
-        html_body = render_broadcast_template(
-            project, title, message, action_url, action_label, custom_header, custom_footer, unsub_url
-        )
-        text_body = f"{title}\n\n{message}\n\nUnsubscribe: {unsub_url}"
+    # 1. Create Broadcast Job Document
+    job_doc = {
+        "_id": job_id,
+        "projectId": project_id,
+        "projectName": project["name"],
+        "subject": subject,
+        "title": title,
+        "message": message,
+        "actionUrl": action_url,
+        "actionLabel": action_label,
+        "customHeader": custom_header,
+        "customFooter": custom_footer,
+        "totalRecipients": len(subscribers),
+        "sentCount": 0,
+        "failedCount": 0,
+        "status": "queued",
+        "createdAt": now(),
+    }
+    db.broadcast_jobs.insert_one(job_doc)
 
-        try:
-            send_email_message(recipient, subject, text_body, html_body, from_header, unsub_url=unsub_url)
-            sent_count += 1
-        except Exception:
-            failed_count += 1
+    # 2. Enqueue all recipients
+    queue_items = [
+        {
+            "_id": f"{job_id}:{sub['email']}",
+            "jobId": job_id,
+            "projectId": project_id,
+            "email": sub["email"],
+            "status": "pending",
+            "attempts": 0,
+            "createdAt": now(),
+        }
+        for sub in subscribers
+        if sub.get("email")
+    ]
+    if queue_items:
+        db.broadcast_queue.insert_many(queue_items)
+
+    # 3. Launch background worker thread for throttled dispatch
+    threading.Thread(target=process_broadcast_queue_job, args=(job_id,), daemon=True).start()
 
     return jsonify({
         "success": True,
-        "message": f"Broadcast dispatched for {project['name']}.",
-        "project": project["name"],
-        "totalSubscribers": len(subscribers),
-        "sentCount": sent_count,
-        "failedCount": failed_count,
+        "message": f"Broadcast enqueued for {project['name']}. Processing safely under rate limits.",
+        "jobId": job_id,
+        "totalRecipients": len(queue_items),
+        "status": "queued",
+        "priority": "low_queued",
+        "rateLimitPacing": f"{BROADCAST_DELAY_SECONDS}s per email",
     })
 
 
 @app.post("/api/broadcast/all")
-def broadcast_all_projects():
-    """Broadcasts an announcement to all unique subscribers across ALL projects.
+def enqueue_all_projects_broadcast():
+    """Global broadcast enqueued for all active subscribers across ALL projects.
 
     Requires MASTER_API_KEY.
     """
@@ -869,7 +1033,6 @@ def broadcast_all_projects():
         return fail("invalid_parameters", "'subject' and 'message' are required.", 400)
 
     db = get_db()
-    # Deduplicate active subscribers by email
     cursor = db.subscribers.find({"isSubscribed": True})
     seen_emails = set()
     recipients = []
@@ -877,58 +1040,203 @@ def broadcast_all_projects():
         em = doc.get("email", "").lower().strip()
         if em and em not in seen_emails:
             seen_emails.add(em)
-            recipients.append((doc.get("projectId", "global"), em))
+            recipients.append(em)
 
     if not recipients:
         return jsonify({
             "success": True,
             "message": "No active subscribers found across projects.",
-            "sentCount": 0,
+            "jobId": None,
             "totalRecipients": 0,
         })
 
-    system_project = {
-        "_id": "network",
-        "name": SMTP_FROM_NAME or "Network Update",
-        "fromName": SMTP_FROM_NAME or "Network Announcements",
-        "headerTitle": "Network Announcements",
-        "footerText": "© 2026 dhyey.cc announcements.",
+    job_id = f"job_global_{int(time.time())}_{secrets.token_hex(4)}"
+    job_doc = {
+        "_id": job_id,
+        "projectId": "network",
+        "projectName": SMTP_FROM_NAME or "Network Announcements",
+        "subject": subject_raw,
+        "title": title,
+        "message": message,
+        "actionUrl": action_url,
+        "actionLabel": action_label,
+        "customHeader": custom_header,
+        "customFooter": custom_footer,
+        "totalRecipients": len(recipients),
+        "sentCount": 0,
+        "failedCount": 0,
+        "status": "queued",
+        "createdAt": now(),
     }
-    subject = subject_raw
-    from_header = f"{system_project['fromName']} <{SMTP_FROM_EMAIL}>"
-    sent_count = 0
-    failed_count = 0
+    db.broadcast_jobs.insert_one(job_doc)
 
-    for proj_id, recipient in recipients:
-        unsub_url = get_unsub_url(proj_id, recipient)
-        html_body = render_broadcast_template(
-            system_project, title, message, action_url, action_label, custom_header, custom_footer, unsub_url
-        )
-        text_body = f"{title}\n\n{message}\n\nUnsubscribe: {unsub_url}"
+    queue_items = [
+        {
+            "_id": f"{job_id}:{em}",
+            "jobId": job_id,
+            "projectId": "network",
+            "email": em,
+            "status": "pending",
+            "attempts": 0,
+            "createdAt": now(),
+        }
+        for em in recipients
+    ]
+    if queue_items:
+        db.broadcast_queue.insert_many(queue_items)
 
-        try:
-            send_email_message(recipient, subject, text_body, html_body, from_header, unsub_url=unsub_url)
-            sent_count += 1
-        except Exception:
-            failed_count += 1
+    threading.Thread(target=process_broadcast_queue_job, args=(job_id,), daemon=True).start()
 
     return jsonify({
         "success": True,
-        "message": "Global multi-project broadcast dispatched.",
-        "totalRecipients": len(recipients),
-        "sentCount": sent_count,
-        "failedCount": failed_count,
+        "message": "Global multi-project broadcast enqueued. Processing safely under rate limits.",
+        "jobId": job_id,
+        "totalRecipients": len(queue_items),
+        "status": "queued",
+        "priority": "low_queued",
+        "rateLimitPacing": f"{BROADCAST_DELAY_SECONDS}s per email",
+    })
+
+
+@app.get("/api/broadcast/status/<job_id>")
+def broadcast_job_status(job_id):
+    """Checks progress of a broadcast job in the queue."""
+    db = get_db()
+    job = db.broadcast_jobs.find_one({"_id": job_id})
+    if not job:
+        return fail("not_found", f"Broadcast job '{job_id}' not found.", 404)
+
+    total = job.get("totalRecipients", 0)
+    sent = job.get("sentCount", 0)
+    failed = job.get("failedCount", 0)
+    progress_pct = round(((sent + failed) / total * 100), 1) if total > 0 else 100
+
+    return jsonify({
+        "success": True,
+        "jobId": job_id,
+        "status": job.get("status"),
+        "totalRecipients": total,
+        "sentCount": sent,
+        "failedCount": failed,
+        "progressPercent": progress_pct,
+        "createdAt": job.get("createdAt"),
+        "completedAt": job.get("completedAt"),
+    })
+
+
+@app.post("/api/queue/process")
+def trigger_queue_process():
+    """Manual or Cron trigger to process next pending broadcast jobs."""
+    db = get_db()
+    pending_job = db.broadcast_jobs.find_one({"status": {"$in": ["queued", "processing"]}})
+    if not pending_job:
+        return jsonify({"success": True, "message": "No pending broadcast jobs to process."})
+
+    process_broadcast_queue_job(pending_job["_id"])
+    return jsonify({"success": True, "message": f"Processed batch for job {pending_job['_id']}."})
+
+
+# ------------------------------------------------------------------------------
+# 7. Bring-Your-Own-SMTP (BYOS) Management
+# ------------------------------------------------------------------------------
+@app.route("/api/project/smtp", methods=["GET", "POST", "DELETE"])
+def manage_project_smtp():
+    """Configures, checks, or clears custom SMTP credentials for a project."""
+    project, err = resolve_project()
+    if err:
+        return err
+
+    project_id = str(project["_id"])
+
+    if request.method == "GET":
+        custom = project.get("smtp", {})
+        return jsonify({
+            "success": True,
+            "project": project["name"],
+            "customSmtpEnabled": bool(custom.get("enabled")),
+            "host": custom.get("host") or SMTP_HOST,
+            "port": custom.get("port") or SMTP_PORT,
+            "user": custom.get("user") or (SMTP_USER if not custom.get("enabled") else ""),
+            "fromEmail": custom.get("fromEmail") or (SMTP_FROM_EMAIL if not custom.get("enabled") else ""),
+            "replyTo": project.get("replyToEmail") or custom.get("replyTo") or "",
+        })
+
+    db = get_db()
+
+    if request.method == "DELETE":
+        db.projects.update_one({"_id": project_id}, {"$set": {"smtp": {"enabled": False}}})
+        return jsonify({
+            "success": True,
+            "message": f"Custom SMTP removed for {project['name']}. Reverted to platform default SMTP.",
+        })
+
+    # POST: Configure and verify custom SMTP credentials
+    data = request.get_json(silent=True) or {}
+    host = str(data.get("host") or "smtp.gmail.com").strip()
+    port = int(data.get("port", 465))
+    use_ssl = bool(data.get("secure", True)) or port == 465
+    user = str(data.get("user", "")).strip()
+    password = str(data.get("password", "")).replace(" ", "")
+    from_email = str(data.get("from_email") or user).strip()
+    from_name = str(data.get("from_name") or project["name"]).strip()
+    reply_to = str(data.get("reply_to") or from_email).strip()
+
+    if not user or not password:
+        return fail("invalid_credentials", "'user' (email) and 'password' (or app password) are required.", 400)
+
+    # Test the SMTP credentials immediately before saving
+    context = ssl.create_default_context()
+    try:
+        if use_ssl or port == 465:
+            with smtplib.SMTP_SSL(host, port, context=context, timeout=10) as test_srv:
+                test_srv.login(user, password)
+        else:
+            with smtplib.SMTP(host, port, timeout=10) as test_srv:
+                test_srv.ehlo()
+                test_srv.starttls(context=context)
+                test_srv.ehlo()
+                test_srv.login(user, password)
+    except smtplib.SMTPAuthenticationError:
+        return fail("smtp_auth_failed", "Authentication failed with provided credentials. Check email and password.", 400)
+    except Exception as e:
+        return fail("smtp_connection_failed", f"Failed to connect to {host}:{port} — {e}", 400)
+
+    smtp_doc = {
+        "enabled": True,
+        "host": host,
+        "port": port,
+        "secure": use_ssl,
+        "user": user,
+        "password": password,
+        "fromEmail": from_email,
+        "fromName": from_name,
+        "replyTo": reply_to,
+        "updatedAt": now(),
+    }
+
+    db.projects.update_one(
+        {"_id": project_id},
+        {"$set": {"smtp": smtp_doc, "replyToEmail": reply_to}},
+        upsert=True,
+    )
+
+    return jsonify({
+        "success": True,
+        "message": f"Custom SMTP verified & saved for {project['name']}. Outgoing emails will now use these credentials.",
+        "project": project["name"],
+        "user": user,
+        "fromEmail": from_email,
+        "replyTo": reply_to,
     })
 
 
 # ------------------------------------------------------------------------------
-# 7. Unsubscribe & Resubscribe Handlers
+# 8. Unsubscribe & Resubscribe Handlers
 # ------------------------------------------------------------------------------
 @app.route("/api/unsubscribe", methods=["GET", "POST"])
 def handle_unsubscribe():
     """One-click unsubscribe endpoint supporting both browser GET and RFC 8058 POST."""
     if request.method == "POST":
-        # May be RFC 8058 or JSON request
         data = request.get_json(silent=True) or request.form or {}
         project_id = str(request.args.get("project") or data.get("project") or "").strip()
         email = str(request.args.get("email") or data.get("email") or "").strip().lower()
@@ -941,7 +1249,6 @@ def handle_unsubscribe():
     if not project_id or not email:
         return "<h3>Missing project or email parameter.</h3>", 400
 
-    # Validate signature to prevent unauthorized tampering
     expected_sig = make_unsub_sig(project_id, email)
     if not hmac.compare_digest(expected_sig, sig):
         return "<h3>Invalid or expired unsubscribe link.</h3>", 403
@@ -964,11 +1271,11 @@ def handle_unsubscribe():
 <html>
 <head>
   <meta charset="utf-8">
-  <title>Unsubscribed</title>
+  <title>Unsubscribed from Broadcasts</title>
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <style>
     body {{ font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: #f3f6f9; display: grid; place-items: center; min-height: 100vh; margin: 0; padding: 16px; color: #101828; }}
-    .box {{ background: #fff; max-width: 420px; border-radius: 12px; padding: 32px 24px; text-align: center; border: 1px solid #d0d5dd; box-shadow: 0 4px 12px rgba(0,0,0,0.05); }}
+    .box {{ background: #fff; max-width: 440px; border-radius: 12px; padding: 32px 24px; text-align: center; border: 1px solid #d0d5dd; box-shadow: 0 4px 12px rgba(0,0,0,0.05); }}
     .icon {{ width: 48px; height: 48px; line-height: 48px; border-radius: 50%; background: #f2f4f7; font-size: 20px; margin: 0 auto 16px; }}
     h2 {{ margin: 0 0 8px; font-size: 20px; }}
     p {{ color: #475467; font-size: 14px; line-height: 1.5; margin: 0 0 20px; }}
@@ -1016,7 +1323,7 @@ def handle_resubscribe():
 
 
 # ------------------------------------------------------------------------------
-# 8. Subscribers Listing & Manual Management
+# 9. Subscribers Listing
 # ------------------------------------------------------------------------------
 @app.get("/api/subscribers")
 def list_subscribers():
@@ -1038,7 +1345,7 @@ def list_subscribers():
 
 
 # ------------------------------------------------------------------------------
-# 9. Admin / Project Management (Requires MASTER_API_KEY)
+# 10. Admin / Project Management (Requires MASTER_API_KEY)
 # ------------------------------------------------------------------------------
 @app.get("/api/admin/projects")
 def list_projects():
@@ -1047,7 +1354,7 @@ def list_projects():
         return fail("forbidden", "Master API key required.", 403)
 
     db = get_db()
-    projects = list(db.projects.find({}, {"_id": 1, "name": 1, "apiKey": 1, "fromName": 1, "headerTitle": 1, "footerText": 1, "isActive": 1, "createdAt": 1}))
+    projects = list(db.projects.find({}, {"_id": 1, "name": 1, "apiKey": 1, "fromName": 1, "replyToEmail": 1, "headerTitle": 1, "footerText": 1, "smtp.enabled": 1, "isActive": 1, "createdAt": 1}))
     return jsonify({"success": True, "projects": projects})
 
 
@@ -1065,6 +1372,7 @@ def create_project():
     slug = str(data.get("slug") or name.lower().replace(" ", "_")).strip()
     api_key = str(data.get("api_key") or f"sk_{slug}_{secrets.token_hex(12)}").strip()
     from_name = str(data.get("from_name") or name).strip()
+    reply_to = str(data.get("reply_to") or f"support+{slug}@dhyey.cc").strip()
     header_title = str(data.get("header_title") or name).strip()
     footer_text = str(data.get("footer_text") or f"© {now().year} {name}. All rights reserved.").strip()
 
@@ -1078,8 +1386,10 @@ def create_project():
         "name": name,
         "apiKey": api_key,
         "fromName": from_name,
+        "replyToEmail": reply_to,
         "headerTitle": header_title,
         "footerText": footer_text,
+        "smtp": {"enabled": False},
         "isActive": True,
         "createdAt": now(),
     }

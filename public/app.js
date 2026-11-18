@@ -7,6 +7,7 @@
   let currentKey = "sk_abc_dev123";
   let email = "";
   let timer = null;
+  let jobPollInterval = null;
 
   // Elements
   const chips = $$(".project-chips .chip");
@@ -18,7 +19,6 @@
   // Previews & Placeholders
   const otpSubjectPreview = $("#otp-subject-preview");
   const resetSubjectPreview = $("#reset-subject-preview");
-  const greetingSubjectPreview = $("#greeting-subject-preview");
 
   function say(elId, text, kind = "") {
     const el = $(elId);
@@ -27,7 +27,7 @@
     el.className = `status-msg ${kind}`;
   }
 
-  // Network wrapper with API key injection
+  // Network wrappers with API key injection
   async function post(path, body, customHeaders = {}) {
     try {
       const res = await fetch(path, {
@@ -58,6 +58,19 @@
     }
   }
 
+  async function del(path) {
+    try {
+      const res = await fetch(path, {
+        method: "DELETE",
+        headers: { "X-API-Key": currentKey },
+      });
+      const data = await res.json().catch(() => ({}));
+      return { ok: res.ok, status: res.status, data };
+    } catch {
+      return { ok: false, status: 0, data: {} };
+    }
+  }
+
   // ----------------------------------------------------------------------------
   // Project / Key Switching
   // ----------------------------------------------------------------------------
@@ -67,11 +80,11 @@
 
     otpSubjectPreview.textContent = `Verification Code - ${project}`;
     resetSubjectPreview.textContent = `Reset Password - ${project}`;
-    greetingSubjectPreview.textContent = `Welcome - ${project}`;
 
     $$(".ph-proj").forEach((el) => (el.textContent = project));
     $$(".ph-key").forEach((el) => (el.textContent = key));
 
+    loadSmtpStatus();
     loadSubscribers();
   }
 
@@ -113,14 +126,13 @@
         targetPane.classList.add("active");
       }
 
-      if (tab.dataset.tab === "subscribers") {
-        loadSubscribers();
-      }
+      if (tab.dataset.tab === "subscribers") loadSubscribers();
+      if (tab.dataset.tab === "byos") loadSmtpStatus();
     });
   });
 
   // ----------------------------------------------------------------------------
-  // TAB 1: OTP Verification Logic
+  // TAB 1: OTP Verification Logic (High Priority)
   // ----------------------------------------------------------------------------
   const stepEmail = $("#step-email"), stepCode = $("#step-code"), stepDone = $("#step-done");
   const emailInput = $("#email"), sendBtn = $("#send-btn"), verifyBtn = $("#verify-btn");
@@ -159,13 +171,13 @@
   async function sendOtp(isResend = false) {
     sendBtn.disabled = true;
     resendBtn.disabled = true;
-    say("#msg-otp", "Sending code…");
+    say("#msg-otp", "Sending code instantly (High Priority)…");
 
     const { ok, data } = await post("/api/send-otp", { email });
     sendBtn.disabled = false;
 
     if (ok) {
-      say("#msg-otp", `Code sent for ${data.project}! Expires in ${data.expiresInMinutes}m.`, "ok");
+      say("#msg-otp", `Code sent for ${data.project}! (Reply-To: ${data.replyTo || "default"})`, "ok");
       if (!isResend) openCodeStep(); else cells[0].focus();
       startCooldown(data.cooldownSeconds || 60);
     } else if (data.code === "cooldown") {
@@ -239,10 +251,41 @@
   });
 
   // ----------------------------------------------------------------------------
-  // TAB 2: Broadcast Logic
+  // TAB 2: Broadcast Queue & Progress Tracker
   // ----------------------------------------------------------------------------
   const formBroadcast = $("#form-broadcast");
   const bcastSendBtn = $("#bcast-send-btn");
+  const jobProgressBox = $("#job-progress-box");
+  const jobIdLabel = $("#job-id-label");
+  const jobStatusLabel = $("#job-status-label");
+  const jobProgressFill = $("#job-progress-fill");
+  const jobCountsLabel = $("#job-counts-label");
+  const jobPctLabel = $("#job-pct-label");
+
+  function startJobPolling(jobId) {
+    clearInterval(jobPollInterval);
+    jobProgressBox.hidden = false;
+    jobIdLabel.textContent = jobId;
+
+    const poll = async () => {
+      const { ok, data } = await get(`/api/broadcast/status/${jobId}`);
+      if (!ok) return;
+
+      jobStatusLabel.textContent = data.status;
+      jobStatusLabel.className = `badge ${data.status === "completed" ? "active" : ""}`;
+      jobProgressFill.style.width = `${data.progressPercent}%`;
+      jobCountsLabel.textContent = `${data.sentCount} sent (${data.failedCount} failed) of ${data.totalRecipients}`;
+      jobPctLabel.textContent = `${data.progressPercent}%`;
+
+      if (data.status === "completed" || data.status === "failed") {
+        clearInterval(jobPollInterval);
+        say("#msg-broadcast", `Broadcast ${data.status}! All ${data.sentCount} emails delivered.`, "ok");
+      }
+    };
+
+    poll();
+    jobPollInterval = setInterval(poll, 1500);
+  }
 
   formBroadcast.addEventListener("submit", async (e) => {
     e.preventDefault();
@@ -258,7 +301,7 @@
     if (!subject || !message) return say("#msg-broadcast", "Subject and message are required.", "err");
 
     bcastSendBtn.disabled = true;
-    say("#msg-broadcast", "Dispatching broadcast…");
+    say("#msg-broadcast", "Enqueuing broadcast job…");
 
     const endpoint = scope === "all" ? "/api/broadcast/all" : "/api/broadcast";
     const { ok, data } = await post(endpoint, {
@@ -272,15 +315,98 @@
     });
     bcastSendBtn.disabled = false;
 
-    if (ok) {
-      say("#msg-broadcast", `Success: ${data.sentCount} sent (${data.totalSubscribers || data.totalRecipients || 0} active recipients).`, "ok");
+    if (ok && data.jobId) {
+      say("#msg-broadcast", data.message, "ok");
+      startJobPolling(data.jobId);
     } else {
-      say("#msg-broadcast", data.error || "Broadcast failed.", "err");
+      say("#msg-broadcast", data.message || data.error || "Broadcast failed.", ok ? "ok" : "err");
     }
   });
 
   // ----------------------------------------------------------------------------
-  // TAB 3: Subscribers Viewer
+  // TAB 3: Bring Your Own SMTP (BYOS) & Reply-To
+  // ----------------------------------------------------------------------------
+  const formByos = $("#form-byos");
+  const byosSaveBtn = $("#byos-save-btn");
+  const byosDeleteBtn = $("#byos-delete-btn");
+
+  async function loadSmtpStatus() {
+    const { ok, data } = await get("/api/project/smtp");
+    if (!ok) return;
+
+    const dot = $("#smtp-dot");
+    const title = $("#smtp-status-title");
+    const desc = $("#smtp-status-desc");
+
+    if (data.customSmtpEnabled) {
+      dot.className = "dot active";
+      title.textContent = `Custom SMTP Active (${data.user})`;
+      desc.textContent = `Emails for ${data.project} are sent through this custom email. Zero load on platform owner email. Reply-To: ${data.replyTo || data.user}`;
+      $("#byos-user").value = data.user || "";
+      $("#byos-reply-to").value = data.replyTo || "";
+      $("#byos-from-name").value = data.fromName || "";
+    } else {
+      dot.className = "dot default";
+      title.textContent = "Platform Default SMTP Active";
+      desc.textContent = `Using default platform SMTP (${data.host}). Add your own email & app password below to offload all traffic. Reply-To: ${data.replyTo || "support"}`;
+      $("#byos-reply-to").value = data.replyTo || "";
+    }
+
+    // Update Project chip tag
+    const tagEl = $(`#tag-${currentProject}`);
+    if (tagEl) {
+      tagEl.textContent = `Reply-To: ${data.replyTo ? data.replyTo.split("@")[0] + "@…" : "support@…"}`;
+    }
+  }
+
+  formByos.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const user = $("#byos-user").value.trim();
+    const password = $("#byos-password").value.trim();
+    const replyTo = $("#byos-reply-to").value.trim();
+    const fromName = $("#byos-from-name").value.trim();
+    const host = $("#byos-host").value.trim();
+    const port = parseInt($("#byos-port").value.trim() || "465", 10);
+
+    if (!user || !password) return say("#msg-byos", "Email address and App Password are required.", "err");
+
+    byosSaveBtn.disabled = true;
+    say("#msg-byos", "Testing SMTP connection & saving credentials…");
+
+    const { ok, data } = await post("/api/project/smtp", {
+      user,
+      password,
+      reply_to: replyTo || undefined,
+      from_name: fromName || undefined,
+      host: host || "smtp.gmail.com",
+      port,
+      secure: port === 465,
+    });
+    byosSaveBtn.disabled = false;
+
+    if (ok) {
+      say("#msg-byos", "Success! Custom SMTP verified and saved. All emails will now send through this account.", "ok");
+      $("#byos-password").value = "";
+      loadSmtpStatus();
+    } else {
+      say("#msg-byos", data.error || "SMTP verification failed.", "err");
+    }
+  });
+
+  byosDeleteBtn.addEventListener("click", async () => {
+    if (!confirm(`Revert ${currentProject} back to platform default SMTP?`)) return;
+    say("#msg-byos", "Reverting…");
+    const { ok, data } = await del("/api/project/smtp");
+    if (ok) {
+      say("#msg-byos", "Reverted to platform default SMTP.", "ok");
+      $("#byos-user").value = "";
+      $("#byos-password").value = "";
+      loadSmtpStatus();
+    }
+  });
+
+  // ----------------------------------------------------------------------------
+  // TAB 4: Subscribers Viewer
   // ----------------------------------------------------------------------------
   async function loadSubscribers() {
     const tbody = $("#subs-tbody");
@@ -314,7 +440,7 @@
   $("#refresh-subs-btn").addEventListener("click", loadSubscribers);
 
   // ----------------------------------------------------------------------------
-  // TAB 4 & 5: Reset Password & Greeting Form
+  // TAB 5: Reset Password Form
   // ----------------------------------------------------------------------------
   const formReset = $("#form-reset");
   const resetSendBtn = $("#reset-send-btn");
@@ -329,7 +455,7 @@
     if (!toEmail) return say("#msg-reset", "Enter recipient email address.", "err");
 
     resetSendBtn.disabled = true;
-    say("#msg-reset", "Sending password reset email…");
+    say("#msg-reset", "Sending password reset instantly (High Priority)…");
 
     const { ok, data } = await post("/api/send-reset-password", {
       email: toEmail,
@@ -340,45 +466,10 @@
     resetSendBtn.disabled = false;
 
     if (ok) {
-      say("#msg-reset", `Sent with subject: "${data.subject}"`, "ok");
+      say("#msg-reset", `Sent with subject: "${data.subject}" (Reply-To: ${data.replyTo || "default"})`, "ok");
       loadSubscribers();
     } else {
       say("#msg-reset", data.error || "Failed to send reset email.", "err");
-    }
-  });
-
-  const formGreeting = $("#form-greeting");
-  const greetingSendBtn = $("#greeting-send-btn");
-
-  formGreeting.addEventListener("submit", async (e) => {
-    e.preventDefault();
-    const toEmail = $("#greet-email").value.trim();
-    const name = $("#greet-name").value.trim();
-    const title = $("#greet-title").value.trim();
-    const message = $("#greet-message").value.trim();
-    const actionUrl = $("#greet-action-url").value.trim();
-    const actionLabel = $("#greet-action-label").value.trim();
-
-    if (!toEmail) return say("#msg-greeting", "Enter recipient email address.", "err");
-
-    greetingSendBtn.disabled = true;
-    say("#msg-greeting", "Sending greeting email…");
-
-    const { ok, data } = await post("/api/send-greeting", {
-      email: toEmail,
-      name: name || undefined,
-      title: title || undefined,
-      message: message || undefined,
-      action_url: actionUrl || undefined,
-      action_label: actionLabel || undefined,
-    });
-    greetingSendBtn.disabled = false;
-
-    if (ok) {
-      say("#msg-greeting", `Sent with subject: "${data.subject}"`, "ok");
-      loadSubscribers();
-    } else {
-      say("#msg-greeting", data.error || "Failed to send greeting.", "err");
     }
   });
 
@@ -397,4 +488,7 @@
       });
     });
   });
+
+  // Initial load
+  loadSmtpStatus();
 })();
