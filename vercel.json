@@ -1,3 +1,5 @@
 {
-  "rewrites": [{ "source": "/api/(.*)", "destination": "/api/index" }]
+  "rewrites": [
+    { "source": "/api/(.*)", "destination": "/api/index?__vpath=$1" }
+  ]
 }

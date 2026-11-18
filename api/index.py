@@ -24,11 +24,12 @@ import socket
 import ssl
 import threading
 import time
+import urllib.parse
 from datetime import datetime, timedelta, timezone
 from email.message import EmailMessage
 from html import escape
 
-from flask import Flask, jsonify, request
+from flask import Flask, jsonify, request, send_from_directory
 from pymongo import ASCENDING, MongoClient, ReturnDocument
 
 # ==============================================================================
@@ -84,8 +85,50 @@ BROADCAST_DELAY_SECONDS = float(os.getenv("BROADCAST_DELAY_SECONDS", "1.2"))
 EMAIL_RE = re.compile(r"^[A-Za-z0-9._%+\-]+@[A-Za-z0-9.\-]+\.[A-Za-z]{2,}$")
 ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "public")
 
-app = Flask(__name__, static_folder=ROOT, static_url_path="")
+app = Flask(__name__, static_folder=None)
 app.config["MAX_CONTENT_LENGTH"] = 32 * 1024  # 32 KB body limit
+
+
+class VercelPathRewriteMiddleware:
+    """WSGI middleware ensuring proper sub-routing when deployed as a single serverless function on Vercel."""
+
+    def __init__(self, wsgi_app):
+        self.wsgi_app = wsgi_app
+
+    def __call__(self, environ, start_response):
+        path = environ.get("PATH_INFO", "")
+        # Check if request was routed or rewritten to the entrypoint
+        if path in ("/api/index", "/api/index/", "/api", "/api/"):
+            # 1. Edge rewrite header (Vercel)
+            matched = (
+                environ.get("HTTP_X_MATCHED_PATH")
+                or environ.get("HTTP_X_FORWARDED_URI")
+                or environ.get("HTTP_X_INVOKE_PATH")
+            )
+            if matched and matched.startswith("/api/") and matched not in ("/api/index", "/api/index/"):
+                environ["PATH_INFO"] = matched.split("?")[0]
+            else:
+                # 2. Query string fallback from vercel.json rewrite rule
+                qs = environ.get("QUERY_STRING", "")
+                if qs:
+                    params = urllib.parse.parse_qs(qs)
+                    vpath = params.get("__vpath", [None])[0] or params.get("__path", [None])[0]
+                    if vpath:
+                        clean_vpath = vpath.lstrip("/")
+                        environ["PATH_INFO"] = f"/api/{clean_vpath}"
+                        # Filter out internal query parameters
+                        filtered = [
+                            (k, v)
+                            for k, vals in params.items()
+                            if k not in ("__vpath", "__path")
+                            for v in vals
+                        ]
+                        environ["QUERY_STRING"] = urllib.parse.urlencode(filtered)
+
+        return self.wsgi_app(environ, start_response)
+
+
+app.wsgi_app = VercelPathRewriteMiddleware(app.wsgi_app)
 
 
 @app.before_request
@@ -1527,9 +1570,49 @@ def unexpected(exc):
     return fail("server_error", "An unexpected server error occurred.", 500)
 
 
-@app.route("/", methods=["GET", "POST", "OPTIONS"], strict_slashes=False)
+@app.route("/api/index", methods=["GET", "POST", "OPTIONS"], strict_slashes=False)
+def vercel_entrypoint():
+    """Fallback handler when /api/index is invoked directly without rewrite metadata."""
+    if request.method == "OPTIONS":
+        return jsonify({"status": "ok"}), 200
+
+    if request.method == "GET":
+        return jsonify({
+            "service": "Personal OTP & Email Gateway",
+            "status": "healthy",
+            "endpoints": [
+                "/api/send-otp",
+                "/api/verify-otp",
+                "/api/send-reset-password",
+                "/api/send-greeting",
+                "/api/send-mail",
+                "/api/broadcast",
+                "/api/project/smtp",
+                "/api/subscribers",
+            ],
+        })
+
+    data = request.get_json(silent=True) or {}
+    if "otp" in data and "email" in data:
+        return verify_otp()
+    if "email" in data:
+        return send_otp()
+
+    return fail("bad_request", "POST to /api/index requires an action or payload. Use specific endpoints like /api/send-otp.", 400)
+
+
+@app.route("/", methods=["GET", "OPTIONS"], strict_slashes=False)
 def serve_index():
-    return app.send_static_file("index.html")
+    return send_from_directory(ROOT, "index.html")
+
+
+@app.route("/<path:path>", methods=["GET", "POST", "OPTIONS", "DELETE", "PUT"], strict_slashes=False)
+def serve_static(path):
+    if request.method in ("GET", "OPTIONS", "HEAD"):
+        file_path = os.path.join(ROOT, path)
+        if os.path.isfile(file_path):
+            return send_from_directory(ROOT, path)
+    return fail("not_found", f"Unknown route or resource '/{path}'.", 404)
 
 
 if __name__ == "__main__":
