@@ -33,6 +33,21 @@ from pymongo import ASCENDING, MongoClient, ReturnDocument
 # ==============================================================================
 # Environment & Configuration
 # ==============================================================================
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    _env_file = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
+    if os.path.exists(_env_file):
+        with open(_env_file, "r", encoding="utf-8") as _f:
+            for _line in _f:
+                _line = _line.strip()
+                if _line and not _line.startswith("#") and "=" in _line:
+                    _k, _v = _line.split("=", 1)
+                    _k, _v = _k.strip(), _v.strip().strip('"').strip("'")
+                    if _k not in os.environ:
+                        os.environ[_k] = _v
+
 MONGODB_URI = os.getenv("MONGODB_URI", "")
 MONGODB_DB = os.getenv("MONGODB_DB", "otp_service")
 
