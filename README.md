@@ -76,8 +76,8 @@ OTP_SECRET=random_32_byte_secret_string
 
 # Default Platform SMTP (Fallback)
 SMTP_HOST=smtp.gmail.com
-SMTP_PORT=465
-SMTP_SECURE=true
+SMTP_PORT=587
+SMTP_SECURE=false
 SMTP_USER=your_personal_email@gmail.com
 SMTP_PASSWORD=abcd efgh ijkl mnop
 SMTP_FROM_EMAIL=your_personal_email@gmail.com

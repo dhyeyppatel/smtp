@@ -441,7 +441,8 @@ def render_email_shell(project, inner_html, custom_header=None, custom_footer=No
         </div>"""
 
     # 2. Footer Resolution
-    footer_text = custom_footer or (project.get("footerText") if isinstance(project, dict) else f"Automated message for {safe_name}")
+    raw_footer = custom_footer or (project.get("footerText") if isinstance(project, dict) else None)
+    footer_text = str(raw_footer) if raw_footer else f"Automated message for {safe_name}"
     unsub_block = ""
     if unsub_url:
         unsub_block = f"""
