@@ -147,24 +147,36 @@ def hash_otp(project_id, email, otp):
 # ==============================================================================
 # Subscriber Retention & Unsubscribe Tokens
 # ==============================================================================
-def record_subscriber(project_id, email, name=None, source="auto"):
-    """Auto-remembers user email under the given project for future broadcasts."""
+def record_subscriber(project_id, email, name=None, source="auto", reactivate=True):
+    """Auto-remembers user email under the given project.
+    
+    If the user was previously unsubscribed, using a service like OTP or
+    Reset Password automatically restores them to a normal active subscriber.
+    """
     try:
         db = get_db()
         t = now()
+        update_fields = {
+            "updatedAt": t,
+            "email": email,
+            "projectId": project_id,
+            "lastAction": source,
+        }
+        if name:
+            update_fields["name"] = name
+
+        if reactivate:
+            # Re-activates them back to a normal subscriber
+            update_fields["isSubscribed"] = True
+            update_fields["unsubscribedAt"] = None
+            update_fields["resubscribedAt"] = t
+
         db.subscribers.update_one(
             {"_id": f"{project_id}:{email}"},
             {
-                "$set": {
-                    "updatedAt": t,
-                    "email": email,
-                    "projectId": project_id,
-                },
+                "$set": update_fields,
                 "$setOnInsert": {
-                    "isSubscribed": True,
-                    "unsubscribedAt": None,
                     "createdAt": t,
-                    "name": name or "",
                     "source": source,
                 },
             },
@@ -966,8 +978,8 @@ def handle_unsubscribe():
 <body>
   <div class="box">
     <div class="icon">✓</div>
-    <h2>Unsubscribed</h2>
-    <p><strong>{escape(email)}</strong> has been unsubscribed from <strong>{escape(project_id)}</strong> updates.<br><br>You will no longer receive announcements from this project. (Security emails like password resets and OTPs will still arrive when requested).</p>
+    <h2>Unsubscribed from Broadcasts</h2>
+    <p><strong>{escape(email)}</strong> has been unsubscribed from <strong>{escape(project_id)}</strong> announcements.<br><br>You will no longer receive broadcast updates. (Mandatory emails like verification codes and password resets will always be delivered, and using them will automatically reactivate your normal status).</p>
     <a href="{escape(resub_url)}" class="btn">Undo &amp; Re-subscribe</a>
   </div>
 </body>

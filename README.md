@@ -19,8 +19,10 @@ Deployable directly to **Vercel** or accessible behind **Cloudflare**.
 * **Targeted Broadcast System:**
   * **Per-Project Broadcast (`POST /api/broadcast`):** Send updates exclusively to users registered under project `xyz`.
   * **All-Projects Broadcast (`POST /api/broadcast/all`):** Global announcement dispatched across all projects with email deduplication.
-* **One-Click Unsubscribe (RFC 8058 compliant):**
-  * Automatic unsubscribe links in marketing/broadcast emails.
+* **One-Click Unsubscribe (RFC 8058 compliant) with Smart Retention:**
+  * When a user unsubscribes, they are **kept in the database** with `isSubscribed: false`.
+  * **Broadcasts are suppressed** for unsubscribed users, but **mandatory emails (OTPs, Password Resets) are always delivered**.
+  * If an unsubscribed user interacts with the service again (requests an OTP, verifies a code, or requests a password reset), they are **automatically restored to a normal active subscriber**.
   * Native `List-Unsubscribe: One-Click` headers for Gmail & Yahoo inbox compliance.
   * Dedicated unsubscribe confirmation & re-subscribe web pages.
 * **Customizable Headers & Footers:** Set project-wide logo, header titles, and footer legal notes, or override them dynamically per email.
