@@ -61,14 +61,14 @@
 
         <div class="ticket-body">
           <!-- Step 1: Email Form -->
-          <form id="step-email" novalidate>
+          <form id="step-email" novalidate onsubmit="return false;">
             <label for="email">Recipient Email Address</label>
             <input id="email" type="email" autocomplete="email" placeholder="user@example.com" required>
             <button type="submit" id="send-btn" class="btn primary">Send verification code</button>
           </form>
 
           <!-- Step 2: OTP Verification -->
-          <form id="step-code" hidden novalidate>
+          <form id="step-code" hidden novalidate onsubmit="return false;">
             <p class="sent-to">Code sent to <strong id="sent-to"></strong>. <button type="button" class="link-btn" id="change-btn">Change</button></p>
             <fieldset>
               <legend class="sr-only">6-digit code</legend>
@@ -107,7 +107,7 @@
         </div>
         <p class="lede" style="margin-top:6px;">Sends safely under SMTP rate limits (~1.2s delay between sends) with one-click unsubscribe links.</p>
 
-        <form id="form-broadcast" novalidate>
+        <form id="form-broadcast" novalidate onsubmit="return false;">
           <div class="form-group">
             <label>Broadcast Scope</label>
             <div class="scope-options">
@@ -197,7 +197,7 @@
           <p id="smtp-status-desc" style="margin:4px 0 0;font-size:0.85rem;color:var(--muted);"></p>
         </div>
 
-        <form id="form-byos" novalidate style="margin-top:20px;">
+        <form id="form-byos" novalidate style="margin-top:20px;" onsubmit="return false;">
           <div class="form-row">
             <div class="form-group">
               <label for="byos-user">SMTP Email Address</label>
@@ -287,7 +287,7 @@
         </div>
         <p class="lede" style="margin-top:6px;">Sends an email with subject <code id="reset-subject-preview">Reset Password - abc</code></p>
         
-        <form id="form-reset" novalidate>
+        <form id="form-reset" novalidate onsubmit="return false;">
           <div class="form-group">
             <label for="reset-email">Recipient Email</label>
             <input id="reset-email" type="email" placeholder="user@example.com" required>

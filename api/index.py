@@ -20,6 +20,7 @@ import os
 import re
 import secrets
 import smtplib
+import socket
 import ssl
 import threading
 import time
@@ -85,6 +86,24 @@ ROOT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "public")
 
 app = Flask(__name__, static_folder=ROOT, static_url_path="")
 app.config["MAX_CONTENT_LENGTH"] = 32 * 1024  # 32 KB body limit
+
+
+@app.before_request
+def handle_preflight():
+    if request.method == "OPTIONS":
+        res = jsonify({"status": "ok"})
+        res.headers["Access-Control-Allow-Origin"] = "*"
+        res.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+        res.headers["Access-Control-Allow-Headers"] = "Content-Type, X-API-Key, Authorization, X-Project-Name"
+        return res, 200
+
+
+@app.after_request
+def add_cors_headers(response):
+    response.headers["Access-Control-Allow-Origin"] = "*"
+    response.headers["Access-Control-Allow-Methods"] = "GET, POST, PUT, DELETE, OPTIONS"
+    response.headers["Access-Control-Allow-Headers"] = "Content-Type, X-API-Key, Authorization, X-Project-Name"
+    return response
 
 _client = None
 _initialized = False
@@ -502,6 +521,20 @@ def render_broadcast_template(project, title, message, action_url=None, action_l
 # ==============================================================================
 # SMTP Delivery Engine (With BYOS & Reply-To Routing)
 # ==============================================================================
+def _smtp_login(server, user, password):
+    """Logs into the SMTP server, accurately identifying provider credential rejections."""
+    try:
+        server.login(user, password)
+    except smtplib.SMTPAuthenticationError:
+        raise
+    except smtplib.SMTPServerDisconnected as err:
+        # Many providers (like Gmail) immediately close the socket on invalid credentials / revoked app passwords
+        raise smtplib.SMTPAuthenticationError(
+            535,
+            b"Username and password not accepted by SMTP server (BadCredentials). Check your Gmail App Password and 2FA.",
+        ) from err
+
+
 def send_email_message(to_email, subject, text_content, html_content, from_header, unsub_url=None, reply_to=None, project=None):
     """Robust SMTP dispatcher supporting BYOS (Bring-Your-Own-SMTP) and project routing."""
     # Check if project has configured its own custom SMTP
@@ -549,16 +582,24 @@ def send_email_message(to_email, subject, text_content, html_content, from_heade
     context = ssl.create_default_context()
 
     if use_ssl or port == 465:
-        with smtplib.SMTP_SSL(host, port, context=context, timeout=15) as server:
-            server.login(user, password)
-            server.send_message(msg)
-    else:
-        with smtplib.SMTP(host, port, timeout=15) as server:
-            server.ehlo()
-            server.starttls(context=context)
-            server.ehlo()
-            server.login(user, password)
-            server.send_message(msg)
+        try:
+            with smtplib.SMTP_SSL(host, port, context=context, timeout=12) as server:
+                _smtp_login(server, user, password)
+                server.send_message(msg)
+                return
+        except smtplib.SMTPAuthenticationError:
+            raise
+        except (socket.timeout, OSError) as ssl_err:
+            app.logger.warning("Port 465 SSL connection failed (%s). Auto-attempting port 587 STARTTLS...", ssl_err)
+
+    # Port 587 STARTTLS (or configured port)
+    fallback_port = 587 if port == 465 else port
+    with smtplib.SMTP(host, fallback_port, timeout=15) as server:
+        server.ehlo()
+        server.starttls(context=context)
+        server.ehlo()
+        _smtp_login(server, user, password)
+        server.send_message(msg)
 
 
 # ==============================================================================
@@ -623,7 +664,7 @@ def process_broadcast_queue_job(job_id):
 # ==============================================================================
 # API Endpoints
 # ==============================================================================
-@app.get("/api/health")
+@app.route("/api/health", methods=["GET", "OPTIONS"], strict_slashes=False)
 def health():
     """Health & Readiness probe reporting DB and SMTP status."""
     smtp_ok = bool(SMTP_HOST and SMTP_USER and SMTP_PASSWORD and SMTP_FROM_EMAIL)
@@ -652,9 +693,12 @@ def health():
 # ------------------------------------------------------------------------------
 # 1. Send OTP (High-Priority: Synchronous Direct Dispatch)
 # ------------------------------------------------------------------------------
-@app.post("/api/send-otp")
-@app.post("/api/resend-otp")
+@app.route("/api/send-otp", methods=["GET", "POST", "OPTIONS"], strict_slashes=False)
+@app.route("/api/resend-otp", methods=["GET", "POST", "OPTIONS"], strict_slashes=False)
 def send_otp():
+    if request.method == "GET":
+        return fail("bad_request", "This endpoint requires a POST request with JSON payload: {'email': '...'}", 400)
+
     project, err = resolve_project()
     if err:
         return err
@@ -697,10 +741,11 @@ def send_otp():
     # Direct immediate dispatch (bypasses low-priority broadcast queue)
     try:
         send_email_message(email, subject, text_body, html_body, from_header, reply_to=reply_to, project=project)
-    except smtplib.SMTPAuthenticationError:
-        return fail("smtp_auth", "SMTP authentication failed. Verify credentials.", 502)
-    except (smtplib.SMTPException, OSError):
-        return fail("smtp_unreachable", "Couldn't send the email. Check SMTP host and network.", 502)
+    except smtplib.SMTPAuthenticationError as auth_err:
+        err_msg = auth_err.smtp_error.decode("utf-8", errors="ignore") if isinstance(getattr(auth_err, "smtp_error", None), bytes) else str(getattr(auth_err, "smtp_error", "") or auth_err or "Invalid credentials")
+        return fail("smtp_auth", f"SMTP authentication failed: {err_msg}", 502)
+    except (smtplib.SMTPException, OSError) as net_err:
+        return fail("smtp_unreachable", f"Couldn't send the email: {net_err}", 502)
 
     t = now()
     db.otps.replace_one(
@@ -734,8 +779,11 @@ def send_otp():
 # ------------------------------------------------------------------------------
 # 2. Verify OTP (High-Priority: Synchronous Direct Verification)
 # ------------------------------------------------------------------------------
-@app.post("/api/verify-otp")
+@app.route("/api/verify-otp", methods=["GET", "POST", "OPTIONS"], strict_slashes=False)
 def verify_otp():
+    if request.method == "GET":
+        return fail("bad_request", "This endpoint requires a POST request with JSON payload: {'email': '...', 'otp': '...'}", 400)
+
     project, err = resolve_project()
     if err:
         return err
@@ -791,8 +839,11 @@ def verify_otp():
 # ------------------------------------------------------------------------------
 # 3. Send Reset Password Email (High-Priority: Synchronous Direct Dispatch)
 # ------------------------------------------------------------------------------
-@app.post("/api/send-reset-password")
+@app.route("/api/send-reset-password", methods=["GET", "POST", "OPTIONS"], strict_slashes=False)
 def send_reset_password():
+    if request.method == "GET":
+        return fail("bad_request", "This endpoint requires a POST request with JSON payload: {'email': '...', 'reset_url': '...'}", 400)
+
     project, err = resolve_project()
     if err:
         return err
@@ -820,11 +871,12 @@ def send_reset_password():
     # Direct immediate dispatch
     try:
         send_email_message(email, subject, text_body, html_body, from_header, reply_to=reply_to, project=project)
-    except smtplib.SMTPAuthenticationError:
-        return fail("smtp_auth", "SMTP authentication failed. Check credentials.", 502)
+    except smtplib.SMTPAuthenticationError as auth_err:
+        err_msg = auth_err.smtp_error.decode("utf-8", errors="ignore") if isinstance(getattr(auth_err, "smtp_error", None), bytes) else str(getattr(auth_err, "smtp_error", "") or auth_err or "Invalid credentials")
+        return fail("smtp_auth", f"SMTP authentication failed ({err_msg}). Check credentials.", 502)
     except Exception as e:
         app.logger.exception(e)
-        return fail("smtp_unreachable", "Couldn't send reset password email.", 502)
+        return fail("smtp_unreachable", f"Couldn't send reset password email: {e}", 502)
 
     record_subscriber(str(project["_id"]), email, name=name, source="reset_password", reactivate=True)
 
@@ -841,8 +893,11 @@ def send_reset_password():
 # ------------------------------------------------------------------------------
 # 4. Send Greeting / Welcome Email
 # ------------------------------------------------------------------------------
-@app.post("/api/send-greeting")
+@app.route("/api/send-greeting", methods=["GET", "POST", "OPTIONS"], strict_slashes=False)
 def send_greeting():
+    if request.method == "GET":
+        return fail("bad_request", "This endpoint requires a POST request with JSON payload.", 400)
+
     project, err = resolve_project()
     if err:
         return err
@@ -869,11 +924,12 @@ def send_greeting():
 
     try:
         send_email_message(email, subject, text_body, html_body, from_header, unsub_url=unsub_url, reply_to=reply_to, project=project)
-    except smtplib.SMTPAuthenticationError:
-        return fail("smtp_auth", "SMTP authentication failed. Check credentials.", 502)
+    except smtplib.SMTPAuthenticationError as auth_err:
+        err_msg = auth_err.smtp_error.decode("utf-8", errors="ignore") if isinstance(getattr(auth_err, "smtp_error", None), bytes) else str(getattr(auth_err, "smtp_error", "") or auth_err or "Invalid credentials")
+        return fail("smtp_auth", f"SMTP authentication failed ({err_msg}). Check credentials.", 502)
     except Exception as e:
         app.logger.exception(e)
-        return fail("smtp_unreachable", "Couldn't send greeting email.", 502)
+        return fail("smtp_unreachable", f"Couldn't send greeting email: {e}", 502)
 
     record_subscriber(project_id, email, name=name, source="greeting", reactivate=True)
 
@@ -889,8 +945,11 @@ def send_greeting():
 # ------------------------------------------------------------------------------
 # 5. Generic / Custom Email Dispatch
 # ------------------------------------------------------------------------------
-@app.post("/api/send-mail")
+@app.route("/api/send-mail", methods=["GET", "POST", "OPTIONS"], strict_slashes=False)
 def send_mail_custom():
+    if request.method == "GET":
+        return fail("bad_request", "This endpoint requires a POST request with JSON payload: {'to': '...', 'subject': '...'}", 400)
+
     project, err = resolve_project()
     if err:
         return err
@@ -920,11 +979,12 @@ def send_mail_custom():
 
     try:
         send_email_message(to_email, subject, text_raw, html_body, from_header, unsub_url=unsub_url, reply_to=reply_to, project=project)
-    except smtplib.SMTPAuthenticationError:
-        return fail("smtp_auth", "SMTP authentication failed. Check credentials.", 502)
+    except smtplib.SMTPAuthenticationError as auth_err:
+        err_msg = auth_err.smtp_error.decode("utf-8", errors="ignore") if isinstance(getattr(auth_err, "smtp_error", None), bytes) else str(getattr(auth_err, "smtp_error", "") or auth_err or "Invalid credentials")
+        return fail("smtp_auth", f"SMTP authentication failed ({err_msg}). Check credentials.", 502)
     except Exception as e:
         app.logger.exception(e)
-        return fail("smtp_unreachable", "Couldn't send email.", 502)
+        return fail("smtp_unreachable", f"Couldn't send email: {e}", 502)
 
     record_subscriber(project_id, to_email, source="custom_mail", reactivate=True)
 
@@ -940,9 +1000,12 @@ def send_mail_custom():
 # ------------------------------------------------------------------------------
 # 6. Broadcast Queue & Job Endpoints (Rate-Limited, Non-Blocking)
 # ------------------------------------------------------------------------------
-@app.post("/api/broadcast")
+@app.route("/api/broadcast", methods=["GET", "POST", "OPTIONS"], strict_slashes=False)
 def enqueue_project_broadcast():
     """Enqueues a broadcast message to all active subscribers for safe rate-limited delivery."""
+    if request.method == "GET":
+        return fail("bad_request", "This endpoint requires a POST request with JSON payload: {'subject': '...', 'message': '...'}", 400)
+
     project, err = resolve_project()
     if err:
         return err
@@ -1025,12 +1088,15 @@ def enqueue_project_broadcast():
     })
 
 
-@app.post("/api/broadcast/all")
+@app.route("/api/broadcast/all", methods=["GET", "POST", "OPTIONS"], strict_slashes=False)
 def enqueue_all_projects_broadcast():
     """Global broadcast enqueued for all active subscribers across ALL projects.
 
     Requires MASTER_API_KEY.
     """
+    if request.method == "GET":
+        return fail("bad_request", "This endpoint requires a POST request with JSON payload: {'subject': '...', 'message': '...'}", 400)
+
     key = get_api_key_from_request()
     if not MASTER_API_KEY or key != MASTER_API_KEY:
         return fail("forbidden", "Master API key required for global multi-project broadcasts.", 403)
@@ -1113,7 +1179,7 @@ def enqueue_all_projects_broadcast():
     })
 
 
-@app.get("/api/broadcast/status/<job_id>")
+@app.route("/api/broadcast/status/<job_id>", methods=["GET", "OPTIONS"], strict_slashes=False)
 def broadcast_job_status(job_id):
     """Checks progress of a broadcast job in the queue."""
     db = get_db()
@@ -1139,7 +1205,7 @@ def broadcast_job_status(job_id):
     })
 
 
-@app.post("/api/queue/process")
+@app.route("/api/queue/process", methods=["GET", "POST", "OPTIONS"], strict_slashes=False)
 def trigger_queue_process():
     """Manual or Cron trigger to process next pending broadcast jobs."""
     db = get_db()
@@ -1154,7 +1220,7 @@ def trigger_queue_process():
 # ------------------------------------------------------------------------------
 # 7. Bring-Your-Own-SMTP (BYOS) Management
 # ------------------------------------------------------------------------------
-@app.route("/api/project/smtp", methods=["GET", "POST", "DELETE"])
+@app.route("/api/project/smtp", methods=["GET", "POST", "DELETE", "OPTIONS"], strict_slashes=False)
 def manage_project_smtp():
     """Configures, checks, or clears custom SMTP credentials for a project."""
     project, err = resolve_project()
@@ -1203,16 +1269,25 @@ def manage_project_smtp():
     context = ssl.create_default_context()
     try:
         if use_ssl or port == 465:
-            with smtplib.SMTP_SSL(host, port, context=context, timeout=10) as test_srv:
-                test_srv.login(user, password)
+            try:
+                with smtplib.SMTP_SSL(host, port, context=context, timeout=10) as test_srv:
+                    _smtp_login(test_srv, user, password)
+            except (socket.timeout, OSError):
+                # Fallback to 587
+                with smtplib.SMTP(host, 587, timeout=10) as test_srv:
+                    test_srv.ehlo()
+                    test_srv.starttls(context=context)
+                    test_srv.ehlo()
+                    _smtp_login(test_srv, user, password)
         else:
             with smtplib.SMTP(host, port, timeout=10) as test_srv:
                 test_srv.ehlo()
                 test_srv.starttls(context=context)
                 test_srv.ehlo()
-                test_srv.login(user, password)
-    except smtplib.SMTPAuthenticationError:
-        return fail("smtp_auth_failed", "Authentication failed with provided credentials. Check email and password.", 400)
+                _smtp_login(test_srv, user, password)
+    except smtplib.SMTPAuthenticationError as auth_err:
+        err_msg = auth_err.smtp_error.decode("utf-8", errors="ignore") if isinstance(getattr(auth_err, "smtp_error", None), bytes) else str(getattr(auth_err, "smtp_error", "") or auth_err or "Bad credentials")
+        return fail("smtp_auth_failed", f"Authentication failed: {err_msg}. Check email and App Password.", 400)
     except Exception as e:
         return fail("smtp_connection_failed", f"Failed to connect to {host}:{port} — {e}", 400)
 
@@ -1248,7 +1323,7 @@ def manage_project_smtp():
 # ------------------------------------------------------------------------------
 # 8. Unsubscribe & Resubscribe Handlers
 # ------------------------------------------------------------------------------
-@app.route("/api/unsubscribe", methods=["GET", "POST"])
+@app.route("/api/unsubscribe", methods=["GET", "POST", "OPTIONS"], strict_slashes=False)
 def handle_unsubscribe():
     """One-click unsubscribe endpoint supporting both browser GET and RFC 8058 POST."""
     if request.method == "POST":
@@ -1308,7 +1383,7 @@ def handle_unsubscribe():
 </html>"""
 
 
-@app.get("/api/resubscribe")
+@app.route("/api/resubscribe", methods=["GET", "OPTIONS"], strict_slashes=False)
 def handle_resubscribe():
     project_id = str(request.args.get("project", "")).strip()
     email = str(request.args.get("email", "")).strip().lower()
@@ -1340,7 +1415,7 @@ def handle_resubscribe():
 # ------------------------------------------------------------------------------
 # 9. Subscribers Listing
 # ------------------------------------------------------------------------------
-@app.get("/api/subscribers")
+@app.route("/api/subscribers", methods=["GET", "OPTIONS"], strict_slashes=False)
 def list_subscribers():
     project, err = resolve_project()
     if err:
@@ -1362,22 +1437,16 @@ def list_subscribers():
 # ------------------------------------------------------------------------------
 # 10. Admin / Project Management (Requires MASTER_API_KEY)
 # ------------------------------------------------------------------------------
-@app.get("/api/admin/projects")
-def list_projects():
+@app.route("/api/admin/projects", methods=["GET", "POST", "OPTIONS"], strict_slashes=False)
+def handle_admin_projects():
     key = get_api_key_from_request()
     if not MASTER_API_KEY or key != MASTER_API_KEY:
         return fail("forbidden", "Master API key required.", 403)
 
     db = get_db()
-    projects = list(db.projects.find({}, {"_id": 1, "name": 1, "apiKey": 1, "fromName": 1, "replyToEmail": 1, "headerTitle": 1, "footerText": 1, "smtp.enabled": 1, "isActive": 1, "createdAt": 1}))
-    return jsonify({"success": True, "projects": projects})
-
-
-@app.post("/api/admin/projects")
-def create_project():
-    key = get_api_key_from_request()
-    if not MASTER_API_KEY or key != MASTER_API_KEY:
-        return fail("forbidden", "Master API key required.", 403)
+    if request.method == "GET":
+        projects = list(db.projects.find({}, {"_id": 1, "name": 1, "apiKey": 1, "fromName": 1, "replyToEmail": 1, "headerTitle": 1, "footerText": 1, "smtp.enabled": 1, "isActive": 1, "createdAt": 1}))
+        return jsonify({"success": True, "projects": projects})
 
     data = request.get_json(silent=True) or {}
     name = str(data.get("name", "")).strip()
@@ -1391,7 +1460,6 @@ def create_project():
     header_title = str(data.get("header_title") or name).strip()
     footer_text = str(data.get("footer_text") or f"© {now().year} {name}. All rights reserved.").strip()
 
-    db = get_db()
     existing = db.projects.find_one({"$or": [{"_id": slug}, {"apiKey": api_key}]})
     if existing:
         return fail("conflict", f"Project with ID '{slug}' or this API key already exists.", 409)
@@ -1417,7 +1485,7 @@ def create_project():
     }), 201
 
 
-@app.delete("/api/admin/projects/<project_id>")
+@app.route("/api/admin/projects/<project_id>", methods=["DELETE", "OPTIONS"], strict_slashes=False)
 def delete_project(project_id):
     key = get_api_key_from_request()
     if not MASTER_API_KEY or key != MASTER_API_KEY:
@@ -1440,8 +1508,12 @@ def not_found(_):
 
 
 @app.errorhandler(405)
-def bad_method(_):
-    return fail("method_not_allowed", "Wrong HTTP method.", 405)
+def bad_method(e=None):
+    valid_methods = list(getattr(e, "valid_methods", [])) if hasattr(e, "valid_methods") else []
+    msg = f"HTTP method '{request.method}' is not allowed for {request.path}."
+    if valid_methods:
+        msg += f" Allowed methods: {', '.join(valid_methods)}."
+    return fail("method_not_allowed", msg, 405, allowed_methods=valid_methods)
 
 
 @app.errorhandler(413)
@@ -1455,7 +1527,7 @@ def unexpected(exc):
     return fail("server_error", "An unexpected server error occurred.", 500)
 
 
-@app.get("/")
+@app.route("/", methods=["GET", "POST", "OPTIONS"], strict_slashes=False)
 def serve_index():
     return app.send_static_file("index.html")
 
