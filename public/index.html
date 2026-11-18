@@ -1,0 +1,342 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Email Gateway & OTP Service | dhyey.cc</title>
+  <link rel="stylesheet" href="style.css">
+</head>
+<body>
+  <div class="container">
+    <!-- Header -->
+    <header class="header">
+      <div class="brand">
+        <span class="badge">API Gateway</span>
+        <h1>Personal Email & Broadcast Gateway</h1>
+        <p class="subtitle">Multi-project email service: OTPs, resets, greetings, user retention & broadcasts.</p>
+      </div>
+
+      <!-- Project / API Key Selector -->
+      <div class="project-bar">
+        <span class="bar-label">Active Project:</span>
+        <div class="project-chips">
+          <button type="button" class="chip active" data-project="abc" data-key="sk_abc_dev123">
+            <strong>Project abc</strong>
+            <span class="tag">Subject: … - abc</span>
+          </button>
+          <button type="button" class="chip" data-project="xyz" data-key="sk_xyz_dev123">
+            <strong>Project xyz</strong>
+            <span class="tag">Subject: … - xyz</span>
+          </button>
+          <button type="button" class="chip" data-project="custom">
+            <strong>Custom Key</strong>
+          </button>
+        </div>
+        <div class="custom-key-input" id="custom-key-box" hidden>
+          <input type="text" id="api-key-input" placeholder="Enter custom API key (sk_... or Master Key)" spellcheck="false">
+        </div>
+      </div>
+    </header>
+
+    <!-- Main Navigation Tabs -->
+    <nav class="tabs">
+      <button class="tab-btn active" data-tab="otp">OTP Verification</button>
+      <button class="tab-btn" data-tab="broadcast">Broadcasts</button>
+      <button class="tab-btn" data-tab="subscribers">Subscribers</button>
+      <button class="tab-btn" data-tab="reset">Reset Password</button>
+      <button class="tab-btn" data-tab="greeting">Greeting / Welcome</button>
+      <button class="tab-btn" data-tab="docs">API Quickstart</button>
+    </nav>
+
+    <!-- TAB 1: OTP VERIFICATION (Ticket UI) -->
+    <section class="tab-pane active" id="pane-otp">
+      <main class="ticket">
+        <div class="stub">
+          <h2>Email Verification</h2>
+          <p class="lede">Sends a 6-digit code with subject: <code id="otp-subject-preview">Verification Code - abc</code></p>
+        </div>
+
+        <div class="ticket-body">
+          <!-- Step 1: Email Form -->
+          <form id="step-email" novalidate>
+            <label for="email">Recipient Email Address</label>
+            <input id="email" type="email" autocomplete="email" placeholder="user@example.com" required>
+            <button type="submit" id="send-btn" class="btn primary">Send verification code</button>
+          </form>
+
+          <!-- Step 2: OTP Verification -->
+          <form id="step-code" hidden novalidate>
+            <p class="sent-to">Code sent to <strong id="sent-to"></strong>. <button type="button" class="link-btn" id="change-btn">Change</button></p>
+            <fieldset>
+              <legend class="sr-only">6-digit code</legend>
+              <div class="cells" id="cells">
+                <input inputmode="numeric" autocomplete="one-time-code" maxlength="1" aria-label="Digit 1">
+                <input inputmode="numeric" maxlength="1" aria-label="Digit 2">
+                <input inputmode="numeric" maxlength="1" aria-label="Digit 3">
+                <input inputmode="numeric" maxlength="1" aria-label="Digit 4">
+                <input inputmode="numeric" maxlength="1" aria-label="Digit 5">
+                <input inputmode="numeric" maxlength="1" aria-label="Digit 6">
+              </div>
+            </fieldset>
+            <button type="submit" id="verify-btn" class="btn primary">Verify code</button>
+            <button type="button" class="link-btn resend-link" id="resend-btn" disabled>Resend code</button>
+          </form>
+
+          <!-- Step 3: Verified Status -->
+          <div id="step-done" hidden>
+            <div class="done-mark" aria-hidden="true">✓</div>
+            <h3>Email Verified & Remembered</h3>
+            <p class="lede"><span id="done-email"></span> confirmed & recorded for <strong id="done-project"></strong>.</p>
+            <button type="button" id="again-btn" class="btn secondary">Verify another email</button>
+          </div>
+
+          <p id="msg-otp" class="status-msg" role="status" aria-live="polite"></p>
+        </div>
+      </main>
+    </section>
+
+    <!-- TAB 2: BROADCAST SYSTEM -->
+    <section class="tab-pane" id="pane-broadcast" hidden>
+      <div class="card">
+        <h2>Broadcast Email</h2>
+        <p class="lede">Send announcements to retained users with custom header, footer & automatic unsubscribe link.</p>
+
+        <form id="form-broadcast" novalidate>
+          <div class="form-group">
+            <label>Broadcast Scope</label>
+            <div class="scope-options">
+              <label class="radio-label">
+                <input type="radio" name="broadcast-scope" value="project" checked>
+                <span><strong>Current Project</strong> (Only users of <span class="ph-proj">abc</span>)</span>
+              </label>
+              <label class="radio-label">
+                <input type="radio" name="broadcast-scope" value="all">
+                <span><strong>All Projects</strong> (Every user across all projects — requires Master Key)</span>
+              </label>
+            </div>
+          </div>
+
+          <div class="form-row">
+            <div class="form-group">
+              <label for="bcast-subject">Subject Line</label>
+              <input id="bcast-subject" type="text" placeholder="Important Platform Update" required>
+            </div>
+            <div class="form-group">
+              <label for="bcast-title">Email Title / Heading</label>
+              <input id="bcast-title" type="text" placeholder="New Features Released!">
+            </div>
+          </div>
+
+          <div class="form-group">
+            <label for="bcast-message">Message Body (HTML supported)</label>
+            <textarea id="bcast-message" rows="4" placeholder="<p>We are excited to share new updates with you...</p>" required></textarea>
+          </div>
+
+          <div class="form-row">
+            <div class="form-group">
+              <label for="bcast-action-url">Action Button URL (Optional)</label>
+              <input id="bcast-action-url" type="url" placeholder="https://dhyey.cc/update">
+            </div>
+            <div class="form-group">
+              <label for="bcast-action-label">Button Text</label>
+              <input id="bcast-action-label" type="text" placeholder="Read More">
+            </div>
+          </div>
+
+          <details class="advanced-details">
+            <summary>Custom Header &amp; Footer Overrides (Optional)</summary>
+            <div class="form-group" style="margin-top:12px;">
+              <label for="bcast-header">Custom Header HTML / Title</label>
+              <input id="bcast-header" type="text" placeholder="Override header title or HTML snippet">
+            </div>
+            <div class="form-group">
+              <label for="bcast-footer">Custom Footer Text</label>
+              <input id="bcast-footer" type="text" placeholder="Override footer note / address">
+            </div>
+          </details>
+
+          <button type="submit" id="bcast-send-btn" class="btn primary" style="margin-top:16px;">Dispatch Broadcast</button>
+        </form>
+
+        <p id="msg-broadcast" class="status-msg" role="status" aria-live="polite"></p>
+      </div>
+    </section>
+
+    <!-- TAB 3: SUBSCRIBERS VIEWER -->
+    <section class="tab-pane" id="pane-subscribers" hidden>
+      <div class="card">
+        <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:12px;">
+          <div>
+            <h2 style="margin:0;">Retained Users / Subscribers</h2>
+            <p class="lede" style="margin:4px 0 0;">Users automatically recorded per project during OTPs, resets, or greetings.</p>
+          </div>
+          <button type="button" id="refresh-subs-btn" class="btn secondary" style="width:auto;padding:8px 14px;font-size:0.85rem;">Refresh</button>
+        </div>
+
+        <div id="subs-stats" style="margin-bottom:14px;font-size:0.9rem;font-weight:600;color:var(--accent);">
+          Active Subscribers: <span id="subs-count">0</span>
+        </div>
+
+        <div class="subs-table-wrap">
+          <table class="subs-table">
+            <thead>
+              <tr>
+                <th>Email</th>
+                <th>Status</th>
+                <th>Source</th>
+                <th>Recorded At</th>
+              </tr>
+            </thead>
+            <tbody id="subs-tbody">
+              <tr><td colspan="4" style="text-align:center;color:var(--muted);">Click Refresh to load subscribers.</td></tr>
+            </tbody>
+          </table>
+        </div>
+      </div>
+    </section>
+
+    <!-- TAB 4: RESET PASSWORD TESTER -->
+    <section class="tab-pane" id="pane-reset" hidden>
+      <div class="card">
+        <h2>Send Password Reset</h2>
+        <p class="lede">Sends an email with subject <code id="reset-subject-preview">Reset Password - abc</code></p>
+        
+        <form id="form-reset" novalidate>
+          <div class="form-group">
+            <label for="reset-email">Recipient Email</label>
+            <input id="reset-email" type="email" placeholder="user@example.com" required>
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label for="reset-name">User Name (Optional)</label>
+              <input id="reset-name" type="text" placeholder="e.g. John Doe">
+            </div>
+            <div class="form-group">
+              <label for="reset-code">Reset Code (Optional)</label>
+              <input id="reset-code" type="text" placeholder="e.g. 849201">
+            </div>
+          </div>
+          <div class="form-group">
+            <label for="reset-url">Reset Link URL</label>
+            <input id="reset-url" type="url" placeholder="https://yourapp.com/reset-password?token=xyz123" value="https://dhyey.cc/reset-password?token=sample123">
+          </div>
+          <button type="submit" id="reset-send-btn" class="btn primary">Send Reset Email</button>
+        </form>
+
+        <p id="msg-reset" class="status-msg" role="status" aria-live="polite"></p>
+      </div>
+    </section>
+
+    <!-- TAB 5: GREETING EMAIL TESTER -->
+    <section class="tab-pane" id="pane-greeting" hidden>
+      <div class="card">
+        <h2>Send Welcome / Greeting Email</h2>
+        <p class="lede">Sends an email with subject <code id="greeting-subject-preview">Welcome - abc</code></p>
+
+        <form id="form-greeting" novalidate>
+          <div class="form-group">
+            <label for="greet-email">Recipient Email</label>
+            <input id="greet-email" type="email" placeholder="user@example.com" required>
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label for="greet-name">User Name (Optional)</label>
+              <input id="greet-name" type="text" placeholder="e.g. Alex">
+            </div>
+            <div class="form-group">
+              <label for="greet-title">Email Title</label>
+              <input id="greet-title" type="text" value="Welcome aboard!">
+            </div>
+          </div>
+          <div class="form-group">
+            <label for="greet-message">Message Body (HTML supported)</label>
+            <textarea id="greet-message" rows="3">We are delighted to have you with us. Your account is ready.</textarea>
+          </div>
+          <div class="form-row">
+            <div class="form-group">
+              <label for="greet-action-url">Action Button URL (Optional)</label>
+              <input id="greet-action-url" type="url" value="https://dhyey.cc">
+            </div>
+            <div class="form-group">
+              <label for="greet-action-label">Button Text</label>
+              <input id="greet-action-label" type="text" value="Go to Dashboard">
+            </div>
+          </div>
+          <button type="submit" id="greeting-send-btn" class="btn primary">Send Greeting Email</button>
+        </form>
+
+        <p id="msg-greeting" class="status-msg" role="status" aria-live="polite"></p>
+      </div>
+    </section>
+
+    <!-- TAB 6: API QUICKSTART & CODE EXAMPLES -->
+    <section class="tab-pane" id="pane-docs" hidden>
+      <div class="card docs-card">
+        <h2>Developer API Integration</h2>
+        <p class="lede">Ready-to-use snippets for OTPs, broadcasts, password resets, and greetings.</p>
+
+        <!-- Broadcast snippet -->
+        <div class="code-box">
+          <div class="code-header">
+            <span>JavaScript (fetch) — Send Project Broadcast</span>
+            <button class="copy-btn" data-copy="js-bcast">Copy</button>
+          </div>
+          <pre><code id="code-js-bcast">await fetch("https://your-service.vercel.app/api/broadcast", {
+  method: "POST",
+  headers: {
+    "Content-Type": "application/json",
+    "X-API-Key": "<span class="ph-key">sk_abc_dev123</span>" // Broadcasts to all users of <span class="ph-proj">abc</span>
+  },
+  body: JSON.stringify({
+    subject: "Monthly Newsletter",
+    title: "What's new in our platform",
+    message: "&lt;p&gt;Here are your latest product updates...&lt;/p&gt;",
+    action_url: "https://myapp.com/blog",
+    action_label: "Read Article"
+  })
+});</code></pre>
+        </div>
+
+        <!-- Global Broadcast snippet -->
+        <div class="code-box">
+          <div class="code-header">
+            <span>cURL — Global All-Projects Broadcast (Master Key)</span>
+            <button class="copy-btn" data-copy="curl-all">Copy</button>
+          </div>
+          <pre><code id="code-curl-all">curl -X POST https://your-service.vercel.app/api/broadcast/all \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: master_secret_change_me_12345" \
+  -d '{
+    "subject": "Scheduled Maintenance Announcement",
+    "title": "System Update on Sunday",
+    "message": "&lt;p&gt;All project APIs will remain operational.&lt;/p&gt;"
+  }'</code></pre>
+        </div>
+
+        <!-- OTP Snippet -->
+        <div class="code-box">
+          <div class="code-header">
+            <span>Python (requests) — Send OTP</span>
+            <button class="copy-btn" data-copy="py-otp">Copy</button>
+          </div>
+          <pre><code id="code-py-otp">import requests
+
+res = requests.post(
+    "https://your-service.vercel.app/api/send-otp",
+    headers={"X-API-Key": "<span class="ph-key">sk_abc_dev123</span>"},
+    json={"email": "user@example.com"}
+)
+print(res.json())</code></pre>
+        </div>
+      </div>
+    </section>
+
+    <!-- Footer -->
+    <footer class="footer">
+      <p>Personal Email Service &bull; Ready for Gmail SMTP & Google Workspace (@dhyey.cc)</p>
+    </footer>
+  </div>
+
+  <script src="app.js"></script>
+</body>
+</html>
